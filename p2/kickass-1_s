@@ -39,11 +39,9 @@ echo \"Ethernat Setting Done\n\"\n" > /usr/lib/frr/docker-ethernat-start
 RUN chmod +x /usr/lib/frr/docker-ethernat-start
 
 RUN printf "#!/bin/sh\n\
-\n\
 /usr/lib/frr/docker-ethernat-start\n\
-\n\
 /usr/lib/frr/zebra -d -F traditional -A 127.0.0.1 -s 90000000\n\
-\n\
+while true; do /bin/busybox sh ; done \n\
 tail -f /dev/null\n" > /usr/lib/frr/docker-start
 
 RUN chmod +x /usr/lib/frr/docker-start

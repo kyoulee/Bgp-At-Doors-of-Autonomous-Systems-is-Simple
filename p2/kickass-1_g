@@ -1,0 +1,62 @@
+FROM alpine:3.19
+
+RUN apk update && apk add --no-cache \
+    frr \
+    busybox \
+    tini
+
+RUN sed -i 's/zebra=no/zebra=yes/' /etc/frr/daemons && \
+    sed -i 's/bgpd=no/bgpd=yes/' /etc/frr/daemons && \
+    sed -i 's/ospfd=no/ospfd=yes/' /etc/frr/daemons && \
+    sed -i 's/isisd=no/isisd=yes/' /etc/frr/daemons && \
+    sed -i 's/watchfrr_options=.*$/watchfrr_options=""/' /etc/frr/daemons
+
+RUN touch /etc/frr/zebra.conf \
+    /etc/frr/bgpd.conf \
+    /etc/frr/ospfd.conf \
+    /etc/frr/isisd.conf \
+    /etc/frr/vtysh.conf
+
+RUN printf "#!/bin/sh\n\
+assign_ip () {\n\
+    local IFACE=\$1 \n\
+    local ADDR=\$2 \n\
+    \n\
+    echo \"Checking interface \$IFACE...\"\n\
+    \n\
+    if ! ip link show \"\$IFACE\" > /dev/null 2>\$1 ; then \n\
+        echo \"Error: Interface \$IFACE does not exist.\" \n\
+        return 1 \n\
+    fi \n\
+    \n\
+    echo \"Bridge up interface \$IFACE\" \n\
+    ip link set dev \"\$IFACE\" up \n\
+    \n\
+    echo \"Assigning \$ADDR to \$IFACE...\" \n\
+    if ip addr add \"\$ADDR\" dev \"\$IFACE\"; then \n\
+        echo \"Successfully assigned \$ADDR to \$IFACE.\" \n\
+    else \n\
+        echo \"Error: Failed to assign \$ADDR. \" \n\
+        return 1 \n\
+    fi \n\
+    \n\
+    ip -4 addr show \"\$IFACE\" | grep inet \n\
+} \n\
+echo \"Ethernat IP Setting Start\n\" \n\
+assign_ip eth1 30.1.1.1/24 \n\
+echo \"Ethernat IP Setting Done\n\"\n" > /usr/lib/frr/assign-ip-start
+
+RUN chmod +x /usr/lib/frr/assign-ip-start
+
+RUN printf "#!/bin/sh\n\
+/usr/lib/frr/assign-ip-start \n\
+/usr/lib/frr/zebra -d -F traditional -A 127.0.0.1 -s 90000000\n\
+/usr/lib/frr/bgpd -d -F traditional -A 127.0.0.1\n\
+/usr/lib/frr/ospfd -d -F traditional -A 127.0.0.1\n\
+/usr/lib/frr/isisd -d -F traditional -A 127.0.0.1\n\
+while true; do /bin/busybox sh ; done \n\
+tail -f /dev/null\n" > /usr/lib/frr/docker-start
+
+RUN chmod +x /usr/lib/frr/docker-start
+
+CMD ["/sbin/tini", "--", "/usr/lib/frr/docker-start"]
