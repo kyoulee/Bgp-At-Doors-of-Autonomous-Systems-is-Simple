@@ -1,0 +1,34 @@
+FROM alpine:3.19
+
+RUN apk update && apk add --no-cache busybox
+
+RUN printf "#!/bin/sh \n\
+set_ip() { \n\
+    local ip=\$1; local dev=\$2 \n\
+    echo \"[IP] Assigning \$ip to \$dev...\" \n\
+    ip addr flush dev \"\$dev\" 2>/dev/null \n\
+    ip addr add \"\$ip\" dev \"\$dev\" \n\
+    ip link set \"\$dev\" up \n\
+} \n\
+set_gateway() { \n\
+    local gw=\$1 \n\
+    echo \"[ROUTE] Setting default gateway to \$gw...\" \n\
+    ip route del default 2>/dev/null \n\
+    ip route add default via \"\$gw\" \n\
+} \n\
+set_ip \"30.1.1.2/24\" \"eth0\" \n\
+\n\
+ip addr show eth0 \n\
+ip route show \n\
+echo \"[SUCCESS] Network stack initialized.\"\n" > /usr/local/bin/assign-ip-start
+
+RUN chmod +x /usr/local/bin/assign-ip-start
+
+RUN printf "#!/bin/sh \n\
+/usr/local/bin/assign-ip-start \n\
+while true; do /bin/busybox sh ; done \n\
+tail -f /dev/null\n" > /usr/local/bin/docker-start
+
+RUN chmod +x /usr/local/bin/docker-start
+
+CMD ["/usr/local/bin/docker-start"]
