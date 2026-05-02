@@ -17,6 +17,34 @@ RUN touch /etc/frr/zebra.conf \
     /etc/frr/isisd.conf \
     /etc/frr/vtysh.conf
 
+
+RUN printf "#!/bin/sh\n\
+setup_bridge_with_ports () {\n\
+    local br_name=\$1\n\
+    echo \"Received bridge name: \$br_name\"\n\
+    shift\n\
+    if ! brctl show | grep -q \"$br_name\"; then \n\
+        brctl addbr \"\$br_name\" \n\
+        ip link set \"\$br_name\" up \n\
+        echo \"Bridge \"\$br_name\" created and up.\" \n\
+    fi \n\
+    for port in \"\$@\"; do \n\
+        if [ -d \"/sys/class/net/\$port\" ]; then \n\
+            brctl addif \"\$br_name\" \"\$port\" \n\
+            ip link set \"\$port\" up \n\
+            echo \" -> Port \$port added to \$br_name\" \n\
+        else \n\
+            echo \" -> Error: \$port not found, skipping.\" \n\
+        fi \n\
+    done \n\
+    brctl show\n\    
+}\n\
+echo \"Ethernat Bridge Setting Start\n\"\n\
+setup_bridge_with_ports br0 eth0 eth1 \n\
+echo \"Ethernat Bridge Done\n\"\n" > /usr/local/bin/assign-bridge-start
+
+RUN chmod +x /usr/local/bin/assign-bridge-start
+
 RUN printf "#!/bin/sh\n\
 assign_ip () {\n\
     local IFACE=\$1 \n\
@@ -44,12 +72,19 @@ assign_ip () {\n\
 } \n\
 echo \"Ethernat IP Setting Start\n\" \n\
 assign_ip eth1 30.1.1.1/24 \n\
-echo \"Ethernat IP Setting Done\n\"\n" > /usr/lib/frr/assign-ip-start
+echo \"Ethernat IP Setting Done\n\"\n" > /usr/local/bin/assign-ip-start
 
-RUN chmod +x /usr/lib/frr/assign-ip-start
+RUN chmod +x /usr/local/bin/assign-ip-start
+
 
 RUN printf "#!/bin/sh\n\
-/usr/lib/frr/assign-ip-start \n\
+/usr/local/bin/assign-bridge-start \n\
+echo \"Docker Ethernat Setting Done\n\"\n" > /usr/local/bin/docker-ethernat-start
+
+RUN chmod +x /usr/local/bin/docker-ethernat-start
+
+RUN printf "#!/bin/sh\n\
+/usr/local/bin/docker-ethernat-start \n\
 /usr/lib/frr/zebra -d -F traditional -A 127.0.0.1 -s 90000000\n\
 /usr/lib/frr/bgpd -d -F traditional -A 127.0.0.1\n\
 /usr/lib/frr/ospfd -d -F traditional -A 127.0.0.1\n\

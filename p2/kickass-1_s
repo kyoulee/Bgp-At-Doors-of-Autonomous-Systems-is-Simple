@@ -34,12 +34,19 @@ setup_bridge_with_ports () {\n\
 }\n\
 echo \"Ethernat Setting Start\n\"\n\
 setup_bridge_with_ports br0 eth0 eth1 \n\
-echo \"Ethernat Setting Done\n\"\n" > /usr/lib/frr/docker-ethernat-start
+echo \"Ethernat Setting Done\n\"\n" > /usr/local/bin/assign-bridge-start
 
-RUN chmod +x /usr/lib/frr/docker-ethernat-start
+RUN chmod +x /usr/local/bin/assign-bridge-start
 
 RUN printf "#!/bin/sh\n\
-/usr/lib/frr/docker-ethernat-start\n\
+/usr/local/bin/assign-bridge-start \n\
+echo \"Docker Ethernat Setting Done\n\"\n" > /usr/local/bin/docker-ethernat-start
+
+RUN chmod +x /usr/local/bin/docker-ethernat-start
+
+
+RUN printf "#!/bin/sh\n\
+/usr/local/bin/docker-ethernat-start\n\
 /usr/lib/frr/zebra -d -F traditional -A 127.0.0.1 -s 90000000\n\
 while true; do /bin/busybox sh ; done \n\
 tail -f /dev/null\n" > /usr/lib/frr/docker-start
