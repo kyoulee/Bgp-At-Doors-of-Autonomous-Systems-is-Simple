@@ -5,88 +5,320 @@ RUN apk update && apk add --no-cache \
     busybox \
     tini
 
+################################################################################
+# STEP: Common Utility Library Initialization
+#
+# This layer creates a shared shell library to standardize logging formats.
+# It implements a [TAG] messaging pattern to ensure consistent observability
+# across all subsequent scripts and configurations.
+#
+# Usage:
+#   . /usr/local/bin/common-lib.sh
+#   log_status <command> <args>
+################################################################################
+RUN printf "#!/bin/sh\n\
+log_msg() {\n\
+    local tag=\$1\n\
+\n\
+    if [ \$# -lt 2 ]; then\n\
+        echo \"[FATAL] Wrong usage of log_msg!\"\n\
+        echo \"[USAGE] log_msg <TAG> <COMMAND> [ARGUMENTS...]\"\n\
+        return 1\n\
+    fi\n\
+    shift\n\
+    \"\$@\" 2>&1 | sed \"s/^/[\$tag] /\"\n\
+}\n\
+\n\
+log_status() { log_msg \"STATUS\" \"\$@\"; }\n\
+log_init()   { log_msg \"INIT\" \"\$@\"; }\n\
+log_fatal()   { log_msg \"FATAL\" \"\$@\"; }\n\
+log_error()  { log_msg \"ERROR\" \"\$@\"; }\n" > /usr/local/bin/common-lib.sh && \
+chmod +x /usr/local/bin/common-lib.sh
+
+################################################################################
+# STEP: FRR (Free Range Routing) Service Initialization
+#
+# Enables specific routing protocol daemons (Zebra, BGP, OSPF, IS-IS) by 
+# modifying the service configuration. Zebra acts as the central manager 
+# for the underlying kernel routing table.
+#
+# The watchfrr_options are cleared to ensure simplified process monitoring
+# within the containerized environment.
+################################################################################
 RUN sed -i 's/zebra=no/zebra=yes/' /etc/frr/daemons && \
     sed -i 's/bgpd=no/bgpd=yes/' /etc/frr/daemons && \
     sed -i 's/ospfd=no/ospfd=yes/' /etc/frr/daemons && \
     sed -i 's/isisd=no/isisd=yes/' /etc/frr/daemons && \
     sed -i 's/watchfrr_options=.*$/watchfrr_options=""/' /etc/frr/daemons
 
+################################################################################
+# STEP: Routing Protocol Configuration Setup
+#
+# Initializes empty configuration files for the enabled routing daemons.
+# These files must exist for the FRR services to start correctly and are 
+# expected to be populated during runtime or through volume mounts.
+#
+# Included configs: zebra (core), bgpd, ospfd, isisd, and vtysh (CLI).
+################################################################################
 RUN touch /etc/frr/zebra.conf \
     /etc/frr/bgpd.conf \
     /etc/frr/ospfd.conf \
     /etc/frr/isisd.conf \
     /etc/frr/vtysh.conf
 
+################################################################################
+# STEP: FRR Service Control Script
+#
+# This script encapsulates the launch logic for all FRR routing daemons.
+# Separating this from the main entrypoint allows for cleaner service 
+# management and independent troubleshooting of the routing stack.
+################################################################################
 RUN printf "#!/bin/sh\n\
-setup_bridge_with_ports () {\n\
-    local br_name=\$1\n\
-    echo \"Received bridge name: \$br_name\"\n\
-    shift\n\
-    if ! brctl show | grep -q \"$br_name\"; then \n\
-        brctl addbr \"\$br_name\" \n\
-        ip link set \"\$br_name\" up \n\
-        echo \"Bridge \"\$br_name\" created and up.\" \n\
-    fi \n\
-    for port in \"\$@\"; do \n\
-        if [ -d \"/sys/class/net/\$port\" ]; then \n\
-            brctl addif \"\$br_name\" \"\$port\" \n\
-            ip link set \"\$port\" up \n\
-            echo \" -> Port \$port added to \$br_name\" \n\
-        else \n\
-            echo \" -> Error: \$port not found, skipping.\" \n\
-        fi \n\
-    done \n\
-    brctl show\n\    
-}\n\
-echo \"Ethernat Bridge Setting Start\n\"\n\
-setup_bridge_with_ports br0 eth0 eth1 \n\
-echo \"Ethernat Bridge Done\n\"\n" > /usr/local/bin/assign-bridge-start
-
-RUN chmod +x /usr/local/bin/assign-bridge-start
-
-RUN printf "#!/bin/sh\n\
-assign_ip () {\n\
-    local IFACE=\$1 \n\
-    local ADDR=\$2 \n\
-    \n\
-    echo \"Checking interface \$IFACE...\"\n\
-    \n\
-    if ! ip link show \"\$IFACE\" > /dev/null 2>\$1 ; then \n\
-        echo \"Error: Interface \$IFACE does not exist.\" \n\
-        return 1 \n\
-    fi \n\
-    \n\
-    echo \"Bridge up interface \$IFACE\" \n\
-    ip link set dev \"\$IFACE\" up \n\
-    \n\
-    echo \"Assigning \$ADDR to \$IFACE...\" \n\
-    if ip addr add \"\$ADDR\" dev \"\$IFACE\"; then \n\
-        echo \"Successfully assigned \$ADDR to \$IFACE.\" \n\
-    else \n\
-        echo \"Error: Failed to assign \$ADDR. \" \n\
-        return 1 \n\
-    fi \n\
-    \n\
-    ip -4 addr show \"\$IFACE\" | grep inet \n\
-} \n\
-echo \"Ethernat IP Setting Start\n\" \n\
-assign_ip eth1 30.1.1.2/24 \n\
-echo \"Ethernat IP Setting Done\n\"\n" > /usr/local/bin/assign-ip-start
-
-RUN chmod +x /usr/local/bin/assign-ip-start
-
-RUN printf "#!/bin/sh\n\
-/usr/local/bin/assign-bridge-start \n\
-echo \"Docker Ethernat Setting Done\n\"\n" > /usr/local/bin/docker-ethernat-start
-
-RUN chmod +x /usr/local/bin/docker-ethernat-start
-
-RUN printf "#!/bin/sh\n\
-/usr/local/bin/docker-ethernat-start \n\
+. /usr/local/bin/common-lib.sh\n\
+\n\
+echo \"[SYSTEM]Launching FRR Routing Stack...\"\n\
 /usr/lib/frr/zebra -d -F traditional -A 127.0.0.1 -s 90000000\n\
 /usr/lib/frr/bgpd -d -F traditional -A 127.0.0.1\n\
 /usr/lib/frr/ospfd -d -F traditional -A 127.0.0.1\n\
 /usr/lib/frr/isisd -d -F traditional -A 127.0.0.1\n\
+\n\
+echo \"[SUCCESS]All FRR daemons are now running in the background.\"\n" > /usr/local/bin/setup-frr-daemons
+
+RUN chmod +x /usr/local/bin/setup-frr-daemons
+
+################################################################################
+# STEP: Ethernet Bridge Configuration with Multi-Port Binding
+#
+# This script orchestrates the creation of a software bridge (Layer 2) and 
+# assigns an IP address (Layer 3) to the bridge interface. It enables 
+# multi-port binding while ensuring strict state validation for each member 
+# interface.
+#
+# Key Features:
+#  - Idempotent Bridge Creation: Uses 'brctl' to verify or create bridge instances.
+#  - IP Conflict Guard: Aborts if the bridge already carries a conflicting IP.
+#  - Port Sanitization: Skips ports that do not exist or have existing L3 configs
+#    to prevent breaking network isolation in GNS3/VXLAn environments.
+#  - Detailed Verification: Outputs the final spanning tree/port status.
+################################################################################
+RUN printf "#!/bin/sh\n\
+. /usr/local/bin/common-lib.sh\n\
+\n\
+setup_bridge_with_ip_ports () {\n\
+    local br_name=\$1\n\
+    local br_ip_with_mask=\$2\n\
+    local target_ip=\${br_ip_with_mask%%/*}\n\
+    if [ -z \"\$br_name\" ] || [ -z \"\$br_ip_with_mask\" ]; then\n\
+        echo \"[FATAL] Missing arguments! Usage: setup_bridge_with_ip_ports <br_name> <ip/mask> <ports...>\"\n\
+        return 1\n\
+    fi\n\
+    if ! brctl show \"\$br_name\" >/dev/null 2>&1; then\n\
+        brctl addbr \"\$br_name\" || return 1\n\
+    fi\n\
+    ip link set \"\$br_name\" up\n\
+    local current_ipv4=\$(ip -4 -o addr show \"\$br_name\" | awk '{print \$4}')\n\
+    if [ -z \"\$current_ipv4\" ]; then\n\
+        echo \"[ACTION] \$br_name is clean. Assigning \$br_ip_with_mask...\"\n\
+        ip addr add \"\$br_ip_with_mask\" dev \"\$br_name\"\n\
+    elif echo \"\$current_ipv4\" | grep -q \"\$target_ip\"; then\n\
+        echo \"[SKIP] \$br_name already has the target IP \$target_ip.\"\n\
+    else\n\
+        echo \"[FATAL] \$br_name is ALREADY IN USE with: \$current_ipv4\"\n\
+        echo \"[FATAL] Manual intervention required to avoid service disruption.\"\n\
+        return 1\n\
+    fi\n\
+    shift 2\n\
+    for port in \"\$@\"; do\n\
+        if [ ! -d \"/sys/class/net/\$port\" ]; then \n\
+            echo \"[WARN] Interface $port does not exist. Skipping...\" \n\
+            continue; \n\
+        fi \n\
+        if [ -n \"\$(ip -4 -o addr show \"\$port\")\" ]; then \n\
+            echo \"[ERROR] Port \$port has existing config. Skipping to prevent breakage.\" \n\
+            continue; \n\
+        fi \n\
+        if ! brctl show \"\$br_name\" | grep -q \"\$port\"; then \n\
+            brctl addif \"\$br_name\" \"\$port\"\n\
+        fi\n\
+        ip link set \"\$port\" up\n\
+    done\n\
+    echo \"[STATUS] Final Bridge Configuration for: \$br_name\"\n\
+    log_status brctl show \"\$br_name\"\n\
+    log_status ip -4 -o addr show \"\$br_name\"\n\
+    return 0\n\
+}\n\
+\n\
+echo \"[SYSTEM] Ethernat Bridge Configuration Starting...\"\n\
+setup_bridge_with_ip_ports br0 10.1.1.2/24 eth0 eth1 \n\
+echo \"[SYSTEM] Ethernat Bridge Configuration Done.\"\n" > /usr/local/bin/assign-bridge-start
+
+RUN chmod +x /usr/local/bin/assign-bridge-start
+
+################################################################################
+# STEP: VXLAN (Virtual eXtensible LAN) Overlay Configuration
+#
+# This script establishes an L2 over L3 tunnel (VXLAN) to bridge virtual
+# networks across different physical or logical nodes. It encapsulates 
+# Ethernet frames into UDP packets to enable cross-host L2 connectivity.
+#
+# Key Features:
+#  - Deep State Inspection: Parses 'ip -d link' to verify existing VNI and 
+#    Remote IP settings before applying changes.
+#  - Bridge Binding: Standardizes the process of joining a VXLAN tunnel 
+#    interface to a local software bridge (brctl).
+#  - Port Consistency: Forces the use of standard IANA port 4789 for 
+#    consistent VXLAN behavior across the infrastructure.
+################################################################################
+RUN printf "#!/bin/sh\n\
+. /usr/local/bin/common-lib.sh\n\
+\n\
+setup_vxlan_way () {\n\
+    local BR_NAME=\$1 \n\
+    local VNI=\$2 \n\
+    local REMOTE_IP=\$3 \n\
+    local LOCAL_DEV=\$4 \n\
+    local VXLAN_NAME=\"vxlan\$VNI\" \n\
+\n\
+    if [ -z \"\$BR_NAME\" ] || [ -z \"\$VNI\" ] || [ -z \"\$REMOTE_IP\" ] || [ -z \"\$LOCAL_DEV\" ]; then \n\
+        echo \"[FATAL] Missing arguments! Usage: setup_vxlan_way <br> <vni> <remote_ip> <local_dev>\" \n\
+        return 1 \n\
+    fi \n\
+    if [ ! -d \"/sys/class/net/\$LOCAL_DEV\" ]; then \n\
+        echo \"[FATAL] Local device \$LOCAL_DEV not found. Aborting.\" \n\
+        return 1 \n\
+    fi \n\
+    if ! brctl show \"\$BR_NAME\" >/dev/null 2>&1; then  \n\
+        echo \"[FATAL] Bridge $BR_NAME does not exist!\" \n\
+        echo \"[HINT] Please create the bridge manually or via infrastructure config first.\" \n\
+        return 1 \n\
+    fi \n\
+    echo \"[INFO] Confirmed: Bridge \$BR_NAME is ready.\"\n\
+    if ! ip link show \"\$BR_NAME\" | grep -q \"UP\"; then \n\
+        ip link set \"\$BR_NAME\" up \n\
+    fi \n\
+    if ip link show \"\$VXLAN_NAME\" >/dev/null 2>&1; then \n\
+        local CURRENT_VNI=\$(ip -d link show \"\$VXLAN_NAME\" | grep \"vxlan id\" | sed -n 's/.*id \([0-9]*\).*/\1/p') \n\
+        local CURRENT_REMOTE=\$(ip -d link show \"\$VXLAN_NAME\" | grep \"remote\" | sed -n 's/.*remote \([0-9.]*\).*/\1/p') \n\
+        if [ \"\$CURRENT_VNI\" != \"\$VNI\" ] || [ \"\$CURRENT_REMOTE\" != \"\$REMOTE_IP\" ]; then \n\
+            echo \"[FATAL] CONFIG CONFLICT: \$VXLAN_NAME exists with DIFFERENT settings!\" \n\
+            echo \"[DETAIL] Current: VNI \$CURRENT_VNI, Remote \$CURRENT_REMOTE\" \n\
+            echo \"[DETAIL] Target:  VNI \$VNI, Remote \$REMOTE_IP\" \n\
+            echo \"[ABORT] Please delete it manually if you want to change it.\" \n\
+            return 1\n\
+        fi \n\
+        echo \"[KEEP] VXLAN $VXLAN_NAME configuration matches.\" \n\
+    fi \n\
+    if ! ip link show \"\$VXLAN_NAME\" >/dev/null 2>&1; then\n\
+        echo \"[ACTION] Creating VXLAN interface \$VXLAN_NAME...\"\n\
+        ip link add \"\$VXLAN_NAME\" type vxlan id \"\$VNI\" dev \"\$LOCAL_DEV\" group \"\$REMOTE_IP\" dstport 4789 \
+            udpcsum udp6zerocsumtx udp6zerocsumrx|| return 1\n\
+    fi\n\
+    ip link set \"\$VXLAN_NAME\" up\n\
+\n\
+    if ! brctl show \"\$BR_NAME\" | grep -q \"\$VXLAN_NAME\"; then\n\
+        brctl addif \"\$BR_NAME\" \"\$VXLAN_NAME\" || { echo \"[ERROR] Failed to bind VXLAN to Bridge\"; return 1; }\n\
+        echo \"[SUCCESS] \$VXLAN_NAME joined \$BR_NAME.\"\n\
+    fi\n\
+\n\
+    log_status ip -d link show \"\$VXLAN_NAME\" | grep -E \"vxlan id|remote\"\n\
+    return 0\n\
+}\n\
+\n\
+echo \"[SYSTEM] Ethernat Vxlan Setting Start\n\"\n\
+setup_vxlan_way br0 10 239.1.1.1 eth0 \n\
+echo \"[SYSTEM] Ethernat VxLan Done\n\"\n" > /usr/local/bin/assign-vxlan-start
+
+RUN chmod +x /usr/local/bin/assign-vxlan-start
+
+################################################################################
+# STEP: MAC Address Configuration Utility
+#
+# Provides an idempotent way to set hardware (MAC) addresses for network 
+# interfaces. It ensures the interface state is managed correctly during 
+# the transition and verifies the hardware presence before execution.
+################################################################################
+RUN printf "#!/bin/sh \n\
+. /usr/local/bin/common-lib.sh\n\
+\n\
+set_mac() { \n\
+    local mac=\$1 \n\
+    local dev=\$2 \n\
+\n\
+    if [ -z \"\$mac\" ] || [ -z \"\$dev\" ]; then \n\
+        echo \"[FATAL] Missing arguments! Usage: set_mac <mac_address> <device_name>\" \n\
+        return 1 \n\
+    fi \n\
+\n\
+    if [ ! -d \"/sys/class/net/\$dev\" ]; then \n\
+        echo \"[FATAL] Interface \$dev not found.\" \n\
+        return 1 \n\
+    fi \n\
+\n\
+    local current_mac=\$(cat /sys/class/net/\$dev/address) \n\
+    if [ \"\$current_mac\" = \"\$mac\" ]; then \n\
+        echo \"[SKIP] \$dev already has MAC \$mac.\" \n\
+    else \n\
+        echo \"[ACTION] Changing \$dev MAC from \$current_mac to \$mac...\" \n\
+        ip link set \"\$dev\" down \n\
+        if ip link set \"\$dev\" address \"\$mac\"; then \n\
+            ip link set \"\$dev\" up \n\
+            echo \"[SUCCESS] MAC address updated for \$dev.\" \n\
+        else \n\
+            echo \"[ERROR] Failed to set MAC for \$dev. (Check permissions/validity)\" \n\
+            ip link set \"\$dev\" up \n\
+            return 1 \n\
+        fi \n\
+    fi \n\
+} \n\
+\n\
+set_mac \"00:00:00:03:02:00\" \"eth0\" \n\
+set_mac \"00:00:00:03:02:01\" \"eth1\" \n\
+set_mac \"00:00:00:03:02:02\" \"eth2\" \n\
+set_mac \"00:00:00:03:02:03\" \"eth3\" \n" > /usr/local/bin/assign-mac-start
+
+RUN chmod +x /usr/local/bin/assign-mac-start
+
+################################################################################
+# STEP: Ethernet & VXLAN Infrastructure Orchestration
+#
+# This script orchestrates the sequential setup of network infrastructure layers.
+# It ensures that local bridging (Layer 2) is established before initializing 
+# VXLAN tunneling (Overlay), following a strictly ordered initialization pattern.
+#
+# Execution Flow:
+#  1. Local Bridge Setup: Configures br0 and binds physical/virtual interfaces.
+#  2. VXLAN Tunneling: Establishes remote L2-over-L3 connectivity.
+#  3. Final Validation: Signals the completion of the network stack.
+################################################################################
+RUN printf "#!/bin/sh\n\
+/usr/local/bin/assign-bridge-start \n\
+/usr/local/bin/assign-vxlan-start \n\
+/usr/local/bin/assign-mac-start \n\
+echo \"Docker Ethernat Setting Done\n\"\n" > /usr/local/bin/docker-ethernat-start
+
+RUN chmod +x /usr/local/bin/docker-ethernat-start
+
+################################################################################
+# STEP: Master System Entrypoint & Service Orchestration
+#
+# This script serves as the primary PID 1 process (or its proxy) for the 
+# container. It follows a strictly ordered initialization sequence to ensure 
+# architectural integrity:
+#
+# Sequence:
+#  1. Infrastructure Layer: Invokes 'docker-ethernat-start' to configure 
+#     local bridges and VXLAN tunnels.
+#  2. Routing Layer: Invokes 'setup-frr-daemons' to launch the core routing 
+#     stack (Zebra, BGP, etc.) once the network substrate is ready.
+#  3. Interaction Layer: Spawns an infinite busybox shell loop for 
+#     administrative access and container persistence.
+#
+# Design Note: Includes a 'tail -f /dev/null' safety lock to prevent 
+# unexpected container termination.
+################################################################################
+RUN printf "#!/bin/sh\n\
+/usr/local/bin/docker-ethernat-start \n\
+/usr/local/bin/setup-frr-daemons \n\
 while true; do /bin/busybox sh ; done \n\
 tail -f /dev/null\n" > /usr/lib/frr/docker-start
 
