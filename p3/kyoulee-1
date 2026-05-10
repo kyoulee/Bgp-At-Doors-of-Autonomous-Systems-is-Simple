@@ -1,0 +1,203 @@
+FROM alpine:3.19
+
+RUN apk update && apk add --no-cache \
+    frr \
+    busybox \
+    tini
+
+################################################################################
+# STEP: Common Utility Library Initialization
+#
+# This layer creates a shared shell library to standardize logging formats.
+# It implements a [TAG] messaging pattern to ensure consistent observability
+# across all subsequent scripts and configurations.
+#
+# Usage:
+#   . /usr/local/bin/common-lib.sh
+#   log_status <command> <args>
+################################################################################
+RUN printf "#!/bin/sh\n\
+log_msg() {\n\
+    local tag=\$1\n\
+\n\
+    if [ \$# -lt 2 ]; then\n\
+        echo \"[FATAL] Wrong usage of log_msg!\"\n\
+        echo \"[USAGE] log_msg <TAG> <COMMAND> [ARGUMENTS...]\"\n\
+        return 1\n\
+    fi\n\
+    shift\n\
+    \"\$@\" 2>&1 | sed \"s/^/[\$tag] /\"\n\
+}\n\
+\n\
+log_status() { log_msg \"STATUS\" \"\$@\"; }\n\
+log_init()   { log_msg \"INIT\" \"\$@\"; }\n\
+log_fatal()   { log_msg \"FATAL\" \"\$@\"; }\n\
+log_error()  { log_msg \"ERROR\" \"\$@\"; }\n" > /usr/local/bin/common-lib.sh && \
+chmod +x /usr/local/bin/common-lib.sh
+
+################################################################################
+# STEP: FRR (Free Range Routing) Service Initialization
+#
+# Enables specific routing protocol daemons (Zebra, BGP, OSPF) by 
+# modifying the service configuration. Zebra acts as the central manager 
+# for the underlying kernel routing table.
+#
+################################################################################
+RUN sed -i 's/zebra=no/zebra=yes/' /etc/frr/daemons && \
+    sed -i 's/bgpd=no/bgpd=yes/' /etc/frr/daemons && \
+    sed -i 's/ospfd=no/ospfd=yes/' /etc/frr/daemons
+
+RUN printf "\n\
+frr version 9.1 \n\
+frr default traditional \n\
+hostname kyoulee-1 \n\
+log syslog informational \n\
+no ipv6 forwarding \n\
+interface lo \n\
+  ip address 1.1.1.1/32 \n\
+! \n\
+interface eth0 \n\
+  ip address 10.3.1.1/24 \n\
+  no shutdown \n\
+! \n\
+interface eth1 \n\
+  ip address 10.3.1.2/24 \n\
+  no shutdown \n\
+! \n\
+interface eth2 \n\
+  ip address 10.3.1.3/24 \n\
+  no shutdown \n\
+! \n\
+interface eth3 \n\
+  ip address 10.3.1.4/24 \n\
+  no shutdown \n\
+! \n\
+router bgp 1 \n\
+ bgp cluster-id 1.1.1.1 \n\
+ bgp listen range 1.1.1.0/24 peer-group LEAF_GROUP \n\
+ neighbor LEAF_GROUP peer-group \n\
+ neighbor LEAF_GROUP remote-as 1 \n\ 
+ neighbor LEAF_GROUP update-source lo \n\
+ ! \n\
+ address-family l2vpn evpn \n\
+  neighbor LEAF_GROUP activate \n\
+  neighbor LEAF_GROUP route-reflector-client \n\
+ exit-address-family \n\
+! \n\
+router ospf \n\
+ network 1.1.1.1/32 area 0 \n\
+ network 10.3.1.0/24 area 0 \n\
+! \n\
+line vty \n\
+! \n\
+" >> /etc/frr/frr.conf
+
+################################################################################
+# STEP: FRR Service Control Script
+#
+# This script encapsulates the launch logic for all FRR routing daemons.
+# Separating this from the main entrypoint allows for cleaner service 
+# management and independent troubleshooting of the routing stack.
+################################################################################
+RUN printf "#!/bin/sh\n\
+\n\
+echo \"[SYSTEM]Launching FRR Routing Stack...\"\n\
+/usr/lib/frr/frrinit.sh start \n\
+/usr/lib/frr/frrinit.sh status \n\
+echo \"[SUCCESS]All FRR daemons are now running in the background.\"\n" > /usr/local/bin/setup-frr-daemons
+
+RUN chmod +x /usr/local/bin/setup-frr-daemons
+
+################################################################################
+# STEP: MAC Address Configuration Utility
+#
+# Provides an idempotent way to set hardware (MAC) addresses for network 
+# interfaces. It ensures the interface state is managed correctly during 
+# the transition and verifies the hardware presence before execution.
+################################################################################
+RUN printf "#!/bin/sh \n\
+. /usr/local/bin/common-lib.sh\n\
+\n\
+set_mac() { \n\
+    local mac=\$1 \n\
+    local dev=\$2 \n\
+\n\
+    if [ -z \"\$mac\" ] || [ -z \"\$dev\" ]; then \n\
+        echo \"[FATAL] Missing arguments! Usage: set_mac <mac_address> <device_name>\" \n\
+        return 1 \n\
+    fi \n\
+\n\
+    if [ ! -d \"/sys/class/net/\$dev\" ]; then \n\
+        echo \"[FATAL] Interface \$dev not found.\" \n\
+        return 1 \n\
+    fi \n\
+\n\
+    local current_mac=\$(cat /sys/class/net/\$dev/address) \n\
+    if [ \"\$current_mac\" = \"\$mac\" ]; then \n\
+        echo \"[SKIP] \$dev already has MAC \$mac.\" \n\
+    else \n\
+        echo \"[ACTION] Changing \$dev MAC from \$current_mac to \$mac...\" \n\
+        ip link set \"\$dev\" down \n\
+        if ip link set \"\$dev\" address \"\$mac\"; then \n\
+            ip link set \"\$dev\" up \n\
+            echo \"[SUCCESS] MAC address updated for \$dev.\" \n\
+        else \n\
+            echo \"[ERROR] Failed to set MAC for \$dev. (Check permissions/validity)\" \n\
+            ip link set \"\$dev\" up \n\
+            return 1 \n\
+        fi \n\
+    fi \n\
+} \n\
+\n\
+set_mac \"03:00:00:03:01:00\" \"eth0\" \n\
+set_mac \"03:00:00:03:01:01\" \"eth1\" \n\
+set_mac \"03:00:00:03:01:02\" \"eth2\" \n\
+set_mac \"03:00:00:03:01:03\" \"eth3\" \n" > /usr/local/bin/assign-mac-start
+
+RUN chmod +x /usr/local/bin/assign-mac-start
+
+################################################################################
+# STEP: Ethernet & VXLAN Infrastructure Orchestration
+#
+# This script orchestrates the sequential setup of network infrastructure layers.
+# It ensures that local bridging (Layer 2) is established before initializing 
+# VXLAN tunneling (Overlay), following a strictly ordered initialization pattern.
+#
+# Execution Flow:
+#  1. Local Bridge Setup: Configures br0 and binds physical/virtual interfaces.
+#  2. VXLAN Tunneling: Establishes remote L2-over-L3 connectivity.
+#  3. Final Validation: Signals the completion of the network stack.
+################################################################################
+RUN printf "#!/bin/sh\n\
+/usr/local/bin/assign-mac-start \n\
+echo \"Docker Ethernat Setting Done\n\"\n" > /usr/local/bin/docker-ethernat-start
+
+RUN chmod +x /usr/local/bin/docker-ethernat-start
+
+################################################################################
+# STEP: Master System Entrypoint & Service Orchestration
+#
+# This script serves as the primary PID 1 process (or its proxy) for the 
+# container. It follows a strictly ordered initialization sequence to ensure 
+# architectural integrity:
+#
+# Sequence:
+#  1. Infrastructure Layer: Invokes 'docker-ethernat-start' to configure 
+#     local bridges and VXLAN tunnels.
+#  2. Routing Layer: Invokes 'setup-frr-daemons' to launch the core routing 
+#     stack (Zebra, BGP, etc.) once the network substrate is ready.
+#  3. Interaction Layer: Spawns an infinite busybox shell loop for 
+#     administrative access and container persistence.
+#
+# Design Note: Includes a 'tail -f /dev/null' safety lock to prevent 
+# unexpected container termination.
+################################################################################
+RUN printf "#!/bin/sh\n\
+/usr/local/bin/docker-ethernat-start \n\
+/usr/local/bin/setup-frr-daemons \n\
+while true; do /bin/busybox sh ; done \n\
+tail -f /dev/null\n" > /usr/lib/frr/docker-start
+
+RUN chmod +x /usr/lib/frr/docker-start
+
+CMD ["/sbin/tini", "--", "/usr/lib/frr/docker-start"]
