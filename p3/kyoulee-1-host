@@ -37,120 +37,6 @@ log_error()  { log_msg \"ERROR\" \"\$@\"; }\n" > /usr/local/bin/common-lib.sh &&
 chmod +x /usr/local/bin/common-lib.sh
 
 ################################################################################
-# STEP: FRR (Free Range Routing) Service Initialization
-#
-# Enables specific routing protocol daemons (Zebra, BGP, OSPF) by 
-# modifying the service configuration. Zebra acts as the central manager 
-# for the underlying kernel routing table.
-#
-################################################################################
-RUN sed -i 's/zebra=no/zebra=yes/' /etc/frr/daemons && \
-    sed -i 's/bgpd=no/bgpd=yes/' /etc/frr/daemons && \
-    sed -i 's/ospfd=no/ospfd=yes/' /etc/frr/daemons
-
-RUN printf "\n\
-frr version 9.1 \n\
-frr default traditional \n\
-hostname kyoulee-1 \n\
-log syslog informational \n\
-" > /etc/frr/frr.conf
-
-RUN printf "\n\
-!\n\
-interface lo \n\
-  ip address 1.1.1.1/32 \n\
-exit \n\
-interface eth0 \n\
-  description TO_LEAF_1 \n\
-  ip address 10.1.1.1/30 \n\
-  no shutdown \n\
-exit \n\
-interface eth1 \n\
-  description TO_LEAF_2 \n\
-  ip address 10.1.1.5/30 \n\
-  no shutdown \n\
-exit \n\
-interface eth2 \n\
-  description TO_LEAF_3 \n\
-  ip address 10.1.1.9/30 \n\
-  no shutdown \n\
-exit \n\
-interface eth3 \n\
-  description TO_LEAF_4 \n\
-  ip address 10.1.1.13/30 \n\
-  no shutdown \n\
-exit \n\
-! \n\
-" >> /etc/frr/frr.conf
-
-RUN printf "\n\
-! \n\
-router bgp 65001 \n\
-  bgp router-id 1.1.1.1 \n\
-  bgp cluster-id 1.1.1.100 \n\
-  neighbor LEAF-GROUP peer-group \n\
-  neighbor LEAF-GROUP remote-as 65001 \n\
-  neighbor LEAF-GROUP update-source lo \n\
-  neighbor 1.1.1.2 peer-group LEAF-GROUP \n\
-  neighbor 1.1.1.3 peer-group LEAF-GROUP \n\
-  neighbor 1.1.1.4 peer-group LEAF-GROUP \n\
-  address-family ipv4 unicast \n\
-    neighbor LEAF-GROUP activate \n\
-  exit-address-family \n\
-  address-family l2vpn evpn \n\
-    neighbor LEAF-GROUP activate \n\
-    neighbor LEAF-GROUP route-reflector-client \n\
-  exit-address-family \n\
-exit \n\
-! \n\
-" >> /etc/frr/frr.conf
-
-RUN printf "\n\
-! \n\
-router ospf \n\
-  ospf router-id 1.1.1.1 \n\
-exit \n\
-interface lo \n\
-  ip ospf area 0 \n\
-exit \n\
-interface eth0 \n\
-  ip ospf area 0 \n\
-exit \n\
-interface eth1 \n\
-  ip ospf area 0 \n\
-exit \n\
-interface eth2 \n\
-  ip ospf area 0 \n\
-exit \n\
-interface eth3 \n\
-  ip ospf area 0 \n\
-exit \n\
-! \n\
-" >> /etc/frr/frr.conf
-
-
-RUN chown frr:frr /etc/frr/frr.conf && \
-    chmod 640 /etc/frr/frr.conf
-
-################################################################################
-# STEP: FRR Service Control Script
-#
-# This script encapsulates the launch logic for all FRR routing daemons.
-# Separating this from the main entrypoint allows for cleaner service 
-# management and independent troubleshooting of the routing stack.
-################################################################################
-RUN printf "#!/bin/sh\n\
-\n\
-echo \"[SYSTEM]Launching FRR Routing Stack...\"\n\
-/usr/lib/frr/frrinit.sh start \n\
-/usr/lib/frr/frrinit.sh status \n\
-# vtysh -c \"copy running-config startup-config\" \n\
-vtysh -c \"show running-config\" \n\
-echo \"[SUCCESS]All FRR daemons are now running in the background.\"\n" > /usr/local/bin/setup-frr-daemons
-
-RUN chmod +x /usr/local/bin/setup-frr-daemons
-
-################################################################################
 # STEP: MAC Address Configuration Utility
 #
 # Provides an idempotent way to set hardware (MAC) addresses for network 
@@ -191,12 +77,55 @@ set_mac() { \n\
     fi \n\
 } \n\
 \n\
-set_mac \"42:03:01:00:03:00\" \"eth0\" \n\
-set_mac \"42:03:01:00:03:01\" \"eth1\" \n\
-set_mac \"42:03:01:00:03:02\" \"eth2\" \n\
-set_mac \"42:03:01:00:03:03\" \"eth3\" \n" > /usr/local/bin/assign-mac-start
+set_mac \"42:03:00:01:01:00\" \"eth0\" \n\
+" > /usr/local/bin/assign-mac-start
 
 RUN chmod +x /usr/local/bin/assign-mac-start
+
+################################################################################
+# STEP: DHCP Service Initialization
+#
+# This script provides a modular and idempotent mechanism to enable DHCP for 
+# specified network interfaces. It abstracts the configuration logic by 
+# parsing and activating entries within '/etc/network/interfaces'.
+#
+# Key Features:
+#  1. Dynamic Interface Targeting: Uses a functional approach to configure 
+#     arbitrary interfaces (e.g., eth0, br0).
+#  2. Fail-Fast Integrity Check: Validates the existence of the configuration 
+#     file and target interface before applying changes.
+#  3. Standardized Logging: Integrates with 'common-lib.sh' to provide 
+#     consistent observability across the network setup process.
+#
+# Usage:
+#   setup_dhcp_interface <interface_name>
+################################################################################
+RUN printf "#!/bin/sh \n\
+. /usr/local/bin/common-lib.sh \n\
+\n\
+setup_dhcp_interface() { \n\
+    local interface=\$1 \n\
+    if [ -z \"\$interface\" ]; then \n\
+        log_error echo \"[FATAL] No interface specified for DHCP setup.\" \n\
+        return 1 \n\
+    fi \n\
+    if [ ! -f /etc/network/interfaces ]; then \n\
+        log_error echo \"[FATAL] /etc/network/interfaces not found.\" \n\
+        return 1 \n\
+    fi \n\
+    sed -i -r \"s/^#[[:space:]]*auto[[:space:]]+\$interface/auto \$interface/\" /etc/network/interfaces && \\ \n\
+    sed -i -r \"s/^#[[:space:]]*iface[[:space:]]+\$interface[[:space:]]+inet[[:space:]]+dhcp/iface \$interface inet dhcp/\" /etc/network/interfaces \n\
+    log_status ifup \$interface \n\
+    if ! ifup \"\$interface\"; then \n\
+        log_error echo \"[ERROR] ifup failed for \$interface. Check configuration.\" \n\
+        return 1 \n\
+    fi \n\
+}\n\
+\n\
+setup_dhcp_interface \"eth0\"\n\
+" > /usr/local/bin/assign-udhc-start
+
+RUN chmod +x /usr/local/bin/assign-udhc-start
 
 ################################################################################
 # STEP: Ethernet & VXLAN Infrastructure Orchestration
@@ -212,6 +141,7 @@ RUN chmod +x /usr/local/bin/assign-mac-start
 ################################################################################
 RUN printf "#!/bin/sh\n\
 /usr/local/bin/assign-mac-start \n\
+/usr/local/bin/assign-udhc-start \n\
 echo \"Docker Ethernat Setting Done\n\"\n" > /usr/local/bin/docker-ethernat-start
 
 RUN chmod +x /usr/local/bin/docker-ethernat-start
@@ -236,7 +166,6 @@ RUN chmod +x /usr/local/bin/docker-ethernat-start
 ################################################################################
 RUN printf "#!/bin/sh\n\
 /usr/local/bin/docker-ethernat-start \n\
-/usr/local/bin/setup-frr-daemons \n\
 while true; do /bin/busybox sh ; done \n\
 tail -f /dev/null\n" > /usr/lib/frr/docker-start
 
