@@ -145,7 +145,7 @@ echo \"[SYSTEM]Launching FRR Routing Stack...\"\n\
 /usr/lib/frr/frrinit.sh start \n\
 /usr/lib/frr/frrinit.sh status \n\
 # vtysh -c \"copy running-config startup-config\" \n\
-vtysh -c \"show running-config\" \n\
+# vtysh -c \"show running-config\" \n\
 echo \"[SUCCESS]All FRR daemons are now running in the background.\"\n" > /usr/local/bin/setup-frr-daemons
 
 RUN chmod +x /usr/local/bin/setup-frr-daemons

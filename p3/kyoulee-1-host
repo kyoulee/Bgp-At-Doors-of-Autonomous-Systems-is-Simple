@@ -1,7 +1,6 @@
 FROM alpine:3.19
 
 RUN apk update && apk add --no-cache \
-    frr \
     busybox \
     busybox-extras \
     tini
@@ -81,6 +80,77 @@ set_mac \"42:03:00:01:01:00\" \"eth0\" \n\
 " > /usr/local/bin/assign-mac-start
 
 RUN chmod +x /usr/local/bin/assign-mac-start
+################################################################################
+# STEP: Network Interface Configuration
+#
+# Automates the setup of IP addresses and routing tables.
+# Uses idempotent functions (set_ip, set_gateway) to prevent redundant
+# configurations and ensure the system state remains consistent.
+################################################################################
+RUN printf "#!/bin/sh \n\
+. /usr/local/bin/common-lib.sh\n\
+\n\
+set_ip() { \n\
+    local ip=\$1 \n\
+    local dev=\$2 \n\
+    local target_ip=\${ip%%/*} \n\
+\n\
+    if [ -z \"\$ip\" ] || [ -z \"\$dev\" ]; then \n\
+        echo \"[FATAL] Missing arguments! Usage: set_ip <ip/mask> <device_name>\" \n\
+        return 1 \n\
+    fi \n\
+    if [ ! -d \"/sys/class/net/\$dev\" ]; then \n\
+        echo \"[FATAL] Interface \$dev not found.\" \n\
+        return 1 \n\
+    fi \n\
+    local current_ipv4=\$(ip -4 -o addr show \"\$dev\" | awk '{print \$4}') \n\
+    if [ -z \"\$current_ipv4\" ]; then \n\
+        echo \"[ACTION] \$dev is clean. Assigning \$ip...\" \n\
+        ip addr add \"\$ip\" dev \"\$dev\" && ip link set \"\$dev\" up \n\
+    elif echo \"\$current_ipv4\" | grep -q \"\$target_ip\"; then \n\
+        echo \"[SKIP] \$dev already has the target IP \$target_ip.\" \n\
+        ip link set \"\$dev\" up \n\
+    else \n\
+        echo \"[FATAL] \$dev has CONFLICTING config: \$current_ipv4\" \n\
+        echo \"[FATAL] Automatic flush is disabled for safety. Manual check required.\" \n\
+        return 1 \n\
+    fi \n\
+} \n\
+\n\
+set_gateway() { \n\
+    local gw=\$1 \n\
+\n\    
+    if [ -z \"\$gw\" ]; then \n\
+        echo \"[FATAL] Missing arguments! Usage: set_gateway <gateway_ip>\" \n\
+        return 1 \n\
+    fi \n\
+    local current_gw=\$(ip route show default | awk '/default via/ {print \$3}') \n\
+    if [ \"\$current_gw\" = \"\$gw\" ]; then \n\
+        echo \"[SKIP] Default gateway is already set to \$gw.\" \n\
+    elif [ -z \"\$current_gw\" ]; then \n\
+        echo \"[ACTION] No default gateway found. Setting to \$gw...\" \n\
+        if ip route add default via \"\$gw\"; then \n\
+            echo \"[SUCCESS] Default gateway is now \$gw\" \n\
+        else \n\
+            echo \"[ERROR] Failed to set gateway \$gw. (Check reachability)\" \n\
+            return 1 \n\
+        fi \n\
+    else \n\
+        echo \"[FATAL] Default gateway CONFLICT: Current is \$current_gw, Target is \$gw\" \n\
+        echo \"[FATAL] Automatic override is disabled for safety. Manual intervention required.\" \n\
+        return 1 \n\
+    fi \n\
+} \n\
+\n\
+echo \"[SYSTEM] Initializing Network Configuration...\"\n\
+set_ip \"20.1.1.2/24\" \"eth0\" || return 1\n\
+# set_gateway \"20.1.1.254\" || return 1\n\
+echo \"[STATUS] Verification:\"\n\
+log_status ip -4 -o addr show eth1 || echo \"[ERROR] eth1 IPv4 verification failed\"\n\
+# ip route | grep default || echo \"[ERROR] Gateway verification failed\"\n\
+echo \"[SUCCESS] All network configurations applied.\"\n" > /usr/local/bin/assign-ip-start
+
+RUN chmod +x /usr/local/bin/assign-ip-start
 
 ################################################################################
 # STEP: DHCP Service Initialization
@@ -101,28 +171,7 @@ RUN chmod +x /usr/local/bin/assign-mac-start
 #   setup_dhcp_interface <interface_name>
 ################################################################################
 RUN printf "#!/bin/sh \n\
-. /usr/local/bin/common-lib.sh \n\
-\n\
-setup_dhcp_interface() { \n\
-    local interface=\$1 \n\
-    if [ -z \"\$interface\" ]; then \n\
-        log_error echo \"[FATAL] No interface specified for DHCP setup.\" \n\
-        return 1 \n\
-    fi \n\
-    if [ ! -f /etc/network/interfaces ]; then \n\
-        log_error echo \"[FATAL] /etc/network/interfaces not found.\" \n\
-        return 1 \n\
-    fi \n\
-    sed -i -r \"s/^#[[:space:]]*auto[[:space:]]+\$interface/auto \$interface/\" /etc/network/interfaces && \\ \n\
-    sed -i -r \"s/^#[[:space:]]*iface[[:space:]]+\$interface[[:space:]]+inet[[:space:]]+dhcp/iface \$interface inet dhcp/\" /etc/network/interfaces \n\
-    log_status ifup \$interface \n\
-    if ! ifup \"\$interface\"; then \n\
-        log_error echo \"[ERROR] ifup failed for \$interface. Check configuration.\" \n\
-        return 1 \n\
-    fi \n\
-}\n\
-\n\
-setup_dhcp_interface \"eth0\"\n\
+sed -i -r 's/^#*[[:space:]]*auto_time[[:space:]]+.*/auto_time 60/' /etc/network/interfaces && \
 " > /usr/local/bin/assign-udhc-start
 
 RUN chmod +x /usr/local/bin/assign-udhc-start
@@ -141,6 +190,7 @@ RUN chmod +x /usr/local/bin/assign-udhc-start
 ################################################################################
 RUN printf "#!/bin/sh\n\
 /usr/local/bin/assign-mac-start \n\
+/usr/local/bin/assign-ip-start \n\
 /usr/local/bin/assign-udhc-start \n\
 echo \"Docker Ethernat Setting Done\n\"\n" > /usr/local/bin/docker-ethernat-start
 
@@ -167,8 +217,8 @@ RUN chmod +x /usr/local/bin/docker-ethernat-start
 RUN printf "#!/bin/sh\n\
 /usr/local/bin/docker-ethernat-start \n\
 while true; do /bin/busybox sh ; done \n\
-tail -f /dev/null\n" > /usr/lib/frr/docker-start
+tail -f /dev/null\n" > /usr/local/bin/docker-start
 
-RUN chmod +x /usr/lib/frr/docker-start
+RUN chmod +x /usr/local/bin/docker-start
 
-CMD ["/sbin/tini", "--", "/usr/lib/frr/docker-start"]
+CMD ["/sbin/tini", "--", "/usr/local/bin/docker-start"]

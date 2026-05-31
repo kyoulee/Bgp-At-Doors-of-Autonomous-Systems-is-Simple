@@ -130,7 +130,7 @@ echo \"[SYSTEM]Launching FRR Routing Stack...\"\n\
 /usr/lib/frr/frrinit.sh start \n\
 /usr/lib/frr/frrinit.sh status \n\
 # vtysh -c \"copy running-config startup-config\" \n\
-vtysh -c \"show running-config\" \n\
+# vtysh -c \"show running-config\" \n\
 echo \"[SUCCESS]All FRR daemons are now running in the background.\"\n" > /usr/local/bin/setup-frr-daemons
 
 RUN chmod +x /usr/local/bin/setup-frr-daemons
@@ -271,26 +271,20 @@ RUN sed -i -r 's/^#*[[:space:]]*start[[:space:]]+.*/start           20.1.1.2/' /
     sed -i '/^option/s/^/#/' /etc/udhcpd.conf && \
     sed -i -r 's/^#*[[:space:]]*opt[[:space:]]+dns[[:space:]]+[0-9.]+.*/opt     dns     8.8.8.8/' /etc/udhcpd.conf && \
     sed -i -r 's/^#*[[:space:]]*option[[:space:]]+subnet[[:space:]]+[0-9.]+.*/option  subnet  255.255.255.0/' /etc/udhcpd.conf && \
-    sed -i -r 's/^#*[[:space:]]*opt[[:space:]]+router[[:space:]]+[0-9.]+.*/opt     router  20.1.1.1/' /etc/udhcpd.conf
+    sed -i -r 's/^#*[[:space:]]*opt[[:space:]]+router[[:space:]]+[0-9.]+.*/opt     router  20.1.1.1/' /etc/udhcpd.conf && \
+    sed -i -r 's/^#*[[:space:]]*auto_time[[:space:]]+.*/auto_time 60/' /etc/udhcpd.conf && \
+    sed -i 's/^#*lease_file.*/lease_file \/var\/lib\/misc\/udhcpd.leases/' /etc/udhcpd.conf
+
+RUN touch /var/lib/misc/udhcpd.leases
 
 RUN printf "#!/bin/sh\n\
-setup_udhcp_service () { \n\
-    local ipv4=\$1 \n\
-\n\
-    if [ -z \"\$ipv4\" ]; then \n\
-        echo \"[FATAL] Missing arguments! Usage: setup_udhcp_service <ipv4>\" \n\
-        return 1 \n\
-    fi \n\
-    mkdir -p /var/lib/misc \n\
-    [ ! -f /var/lib/udhcpd/udhcpd.leases ] && touch /var/lib/udhcpd/udhcpd.leases \n\
-    if pgrep -x \"udhcpd\" > /dev/null; then \n\
-        log_status echo \"[ERROR] udhcpd is already running. Operation aborted.\" \n\
-        return 1 \n\
-    fi \n\
-    udhcpd -f /etc/udhcpd.conf \& \n\
-    echo \"[STATUS] DHCP service active on br0 (\$ipv4)\" \n\
-} \n\
-setup_udhcp_service 20.1.1.1 \n\
+udhcpd -f /etc/udhcpd.conf > /var/log/udhcpd.log 2>&1 &\n\
+sleep 1\n\
+if pgrep udhcpd > /dev/null; then\n\
+    echo '[SUCCESS] udhcpd is running.'\n\
+else\n\
+    echo '[ERROR] udhcpd failed to start. Check /var/log/udhcpd.log'\n\
+fi\n\
 " > /usr/local/bin/assign-udhc-start
 
 RUN chmod +x /usr/local/bin/assign-udhc-start
