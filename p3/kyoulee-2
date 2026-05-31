@@ -3,6 +3,7 @@ FROM alpine:3.19
 RUN apk update && apk add --no-cache \
     frr \
     busybox \
+    busybox-extras \
     tini
 
 ################################################################################
@@ -56,6 +57,9 @@ log syslog informational \n\
 
 RUN printf "\n\
 ! \n\
+interface lo \n\
+  ip address 1.1.1.2/32 \n\
+exit \n\
 interface eth0 \n\
   description TO_SPINE_1 \n\
   ip address 10.1.1.2/30 \n\
@@ -101,6 +105,9 @@ RUN printf "\n\
 router ospf \n\
   ospf router-id 1.1.1.2 \n\
 exit \n\
+interface lo \n\
+  ip ospf area 0 \n\
+exit \n\
 interface eth0 \n\
   ip ospf area 0 \n\
 exit \n\
@@ -123,7 +130,7 @@ echo \"[SYSTEM]Launching FRR Routing Stack...\"\n\
 /usr/lib/frr/frrinit.sh start \n\
 /usr/lib/frr/frrinit.sh status \n\
 # vtysh -c \"copy running-config startup-config\" \n\
-vtysh -c \"show running-config\" \n\
+# vtysh -c \"show running-config\" \n\
 echo \"[SUCCESS]All FRR daemons are now running in the background.\"\n" > /usr/local/bin/setup-frr-daemons
 
 RUN chmod +x /usr/local/bin/setup-frr-daemons
@@ -245,6 +252,44 @@ echo \"[SYSTEM] Ethernat Bridge Configuration Done.\"\n" > /usr/local/bin/assign
 RUN chmod +x /usr/local/bin/assign-bridge-start
 
 ################################################################################
+# STEP: DHCP Service Initialization
+#
+# This script ensures the persistence of the DHCP lease database and launches
+# the udhcpd daemon on the pre-configured br0 interface.
+#
+# Execution Flow:
+#  1. Environment Preparation: Validates and creates required directories 
+#     for the DHCP lease database.
+#  2. Service Initialization: Launches the udhcpd daemon in the background 
+#     ensuring non-blocking operation.
+################################################################################
+
+RUN sed -i -r 's/^#*[[:space:]]*start[[:space:]]+.*/start           20.1.1.2/' /etc/udhcpd.conf && \
+    sed -i -r 's/^#*[[:space:]]*end[[:space:]]+.*/end             20.1.1.254/' /etc/udhcpd.conf && \
+    sed -i -r 's/^#*[[:space:]]*interface[[:space:]]+.*/interface       br0/' /etc/udhcpd.conf && \
+    sed -i '/^opt/s/^/#/' /etc/udhcpd.conf && \
+    sed -i '/^option/s/^/#/' /etc/udhcpd.conf && \
+    sed -i -r 's/^#*[[:space:]]*opt[[:space:]]+dns[[:space:]]+[0-9.]+.*/opt     dns     8.8.8.8/' /etc/udhcpd.conf && \
+    sed -i -r 's/^#*[[:space:]]*option[[:space:]]+subnet[[:space:]]+[0-9.]+.*/option  subnet  255.255.255.0/' /etc/udhcpd.conf && \
+    sed -i -r 's/^#*[[:space:]]*opt[[:space:]]+router[[:space:]]+[0-9.]+.*/opt     router  20.1.1.1/' /etc/udhcpd.conf && \
+    sed -i -r 's/^#*[[:space:]]*auto_time[[:space:]]+.*/auto_time 60/' /etc/udhcpd.conf && \
+    sed -i 's/^#*lease_file.*/lease_file \/var\/lib\/misc\/udhcpd.leases/' /etc/udhcpd.conf
+
+RUN touch /var/lib/misc/udhcpd.leases
+
+RUN printf "#!/bin/sh\n\
+udhcpd -f /etc/udhcpd.conf > /var/log/udhcpd.log 2>&1 &\n\
+sleep 1\n\
+if pgrep udhcpd > /dev/null; then\n\
+    echo '[SUCCESS] udhcpd is running.'\n\
+else\n\
+    echo '[ERROR] udhcpd failed to start. Check /var/log/udhcpd.log'\n\
+fi\n\
+" > /usr/local/bin/assign-udhc-start
+
+RUN chmod +x /usr/local/bin/assign-udhc-start
+
+################################################################################
 # STEP: Ethernet & VXLAN Infrastructure Orchestration
 #
 # This script orchestrates the sequential setup of network infrastructure layers.
@@ -259,6 +304,7 @@ RUN chmod +x /usr/local/bin/assign-bridge-start
 RUN printf "#!/bin/sh\n\
 /usr/local/bin/assign-mac-start \n\
 /usr/local/bin/assign-bridge-start \n\
+/usr/local/bin/assign-udhc-start \n\
 echo \"Docker Ethernat Setting Done\n\"\n" > /usr/local/bin/docker-ethernat-start
 
 RUN chmod +x /usr/local/bin/docker-ethernat-start
