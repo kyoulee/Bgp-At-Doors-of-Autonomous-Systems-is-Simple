@@ -58,11 +58,11 @@ log syslog informational \n\
 RUN printf "\n\
 ! \n\
 interface lo \n\
-  ip address 1.1.1.2/32 \n\
+  ip address 1.1.1.4/32 \n\
 exit \n\
-interface eth0 \n\
+interface eth2 \n\
   description TO_SPINE_1 \n\
-  ip address 10.1.1.2/30 \n\
+  ip address 10.1.1.10/30 \n\
   no shutdown \n\
 exit \n\
 ! \n\
@@ -71,7 +71,7 @@ exit \n\
 RUN printf "\n\
 ! \n\
 router bgp 65001 \n\
-  bgp router-id 1.1.1.2 \n\
+  bgp router-id 1.1.1.4 \n\
   neighbor 1.1.1.1 remote-as 1 \n\
   neighbor 1.1.1.1 update-source lo \n\
   address-family ipv4 unicast \n\
@@ -87,12 +87,12 @@ exit \n\
 RUN printf "\n\
 ! \n\
 router ospf \n\
-  ospf router-id 1.1.1.2 \n\
+  ospf router-id 1.1.1.4 \n\
 exit \n\
 interface lo \n\
   ip ospf area 0 \n\
 exit \n\
-interface eth0 \n\
+interface eth2 \n\
   ip ospf area 0 \n\
 exit \n\
 ! \n\
@@ -160,12 +160,13 @@ set_mac() { \n\
     fi \n\
 } \n\
 \n\
-set_mac \"42:03:02:00:03:00\" \"eth0\" \n\
-set_mac \"42:03:02:00:03:01\" \"eth1\" \n\
-set_mac \"42:03:02:00:03:02\" \"eth2\" \n\
-set_mac \"42:03:02:00:03:03\" \"eth3\" \n" > /usr/local/bin/assign-mac-start
+set_mac \"42:03:04:00:03:00\" \"eth0\" \n\
+set_mac \"42:03:04:00:03:01\" \"eth1\" \n\
+set_mac \"42:03:04:00:03:02\" \"eth2\" \n\
+set_mac \"42:03:04:00:03:03\" \"eth3\" \n" > /usr/local/bin/assign-mac-start
 
 RUN chmod +x /usr/local/bin/assign-mac-start
+
 ################################################################################
 # STEP: Ethernet Bridge Configuration with Multi-Port Binding
 #
@@ -275,7 +276,7 @@ setup_evpn_bridge() {  \n\
 } \n\
 \n\
 echo \"[SYSTEM] Ethernat Bridge Configuration Starting...\" \n\
-setup_evpn_bridge br0 10 eth1 eth2 eth3 \n\
+setup_evpn_bridge br0 10 eth0 eth1 eth3 \n\
 echo \"[SYSTEM] Ethernat Bridge Configuration Done.\"\n" > /usr/local/bin/assign-bridge-start
 
 RUN chmod +x /usr/local/bin/assign-bridge-start
@@ -293,7 +294,7 @@ RUN chmod +x /usr/local/bin/assign-bridge-start
 #     ensuring non-blocking operation.
 ################################################################################
 
-RUN sed -i -r 's/^#*[[:space:]]*start[[:space:]]+.*/start           20.1.1.2/' /etc/udhcpd.conf && \
+RUN sed -i -r 's/^#*[[:space:]]*start[[:space:]]+.*/start           20.1.1.1/' /etc/udhcpd.conf && \
     sed -i -r 's/^#*[[:space:]]*end[[:space:]]+.*/end             20.1.1.254/' /etc/udhcpd.conf && \
     sed -i -r 's/^#*[[:space:]]*interface[[:space:]]+.*/interface       br0/' /etc/udhcpd.conf && \
     sed -i '/^opt/s/^/#/' /etc/udhcpd.conf && \
