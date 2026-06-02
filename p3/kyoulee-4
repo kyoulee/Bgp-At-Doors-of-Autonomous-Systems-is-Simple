@@ -72,13 +72,14 @@ RUN printf "\n\
 ! \n\
 router bgp 65001 \n\
   bgp router-id 1.1.1.4 \n\
-  neighbor 1.1.1.1 remote-as 1 \n\
+  neighbor 1.1.1.1 remote-as 65001 \n\
   neighbor 1.1.1.1 update-source lo \n\
   address-family ipv4 unicast \n\
     neighbor 1.1.1.1 activate \n\
   exit-address-family \n\
   address-family l2vpn evpn \n\
     neighbor 1.1.1.1 activate \n\
+    advertise-all-vni \n\
   exit-address-family \n\
 exit \n\
 ! \n\
@@ -228,37 +229,37 @@ setup_bridge_with_ip_ports () {\n\
     log_status ip -4 -o addr show \"\$br_name\"\n\
     return 0\n\
 }\n\
-setup_evpn_bridge() {  \n\
+\n\
+setup_evpn_bridge() { \n\
     local br_name=\$1 \n\
     local vlan_id=\$2 \n\
+    local vlan_local=\$3 \n\
     local vxlan_interface=\"vxlan\${vlan_id}\" \n\
-    if [ -z \"\$br_name\" ] || [ -z \"\$vlan_id\" ]; then \n\ 
-        echo \"[FATAL] Usage: setup_evpn_bridge <br_name> <vlan_id> <host_ports...>\" \n\
+\n\
+    if [ -z \"\$br_name\" ] || [ -z \"\$vlan_id\" ] || [ -z \"\$vlan_local\" ]; then \n\
+        echo \"[FATAL] Usage: setup_evpn_bridge <br_name> <vlan_id> <vlan_local> <host_ports...>\" \n\
         return 1 \n\
     fi \n\
 \n\
-    if ! ip link show \"\$br_name\" >/dev/null 2>&1; then \n\
-        echo \"[ACTION] Creating VLAN-aware bridge: \$br_name\" \n\
-        ip link add dev \"\$br_name\" type bridge vlan_filtering 1 || return 1 \n\
+    if ! ip link show \"\$br_name\" >/dev/null 2>\&1; then \n\
+        echo \"[ACTION] Creating Traditional bridge: \$br_name\" \n\
+        ip link add dev \"\$br_name\" type bridge || return 1 \n\
     fi \n\
     ip link set \"\$br_name\" up \n\
 \n\
-    if [ -d \"/sys/class/net/\$vxlan_interface\" ]; then \n\
-        if ! ip link show \"\$vxlan_interface\" | grep -q \"master \$br_name\"; then \n\
-            ip link set \"\$vxlan_interface\" master \"\$br_name\" \n\
-        fi \n\
-        ip link set \"\$vxlan_interface\" up \n\
-\n\
-        bridge vlan add dev \"\$vxlan_interface\" vid \"\$vlan_id\" \n\
-        echo \"[ACTION] Connected VXLAN \$vxlan_interface to \$br_name with VLAN \$vlan_id\" \n\ 
-    else \n\
-        echo \"[WARN] VXLAN interface \$vxlan_interface not found! (먼저 생성되어 있어야 합니다)\" \n\ 
+   if ! ip link show \"\$vxlan_interface\" >/dev/null 2>\&1; then \n\
+        ip link add dev \$vxlan_interface type vxlan id \$vlan_id dstport 4789 local \$vlan_local nolearning \n\
+        echo \"[ACTION] Connected VXLAN \$vxlan_interface to \$br_name\" \n\
     fi \n\
+    ip link set \"\$vxlan_interface\" up \n\
+    echo \"[ACTION] Activated VXLAN interface: \$vxlan_interface (Status: UP)\" \n\
+    ip link set dev \"\$vxlan_interface\" master \"\$br_name\" \n\
+    echo \"[STATUS] Successfully plugged \$vxlan_interface into bridge \$br_name\" \n\
 \n\
-    shift 2 \n\
+    shift 3 \n\
     for port in \"\$@\"; do \n\
         if [ ! -d \"/sys/class/net/\$port\" ]; then  \n\
-            echo \"[WARN] Interface $port does not exist. Skipping...\"  \n\
+            echo \"[WARN] Interface \$port does not exist. Skipping...\"  \n\
             continue \n\
         fi \n\
 \n\
@@ -266,17 +267,15 @@ setup_evpn_bridge() {  \n\
             ip link set \"\$port\" master \"\$br_name\" \n\
         fi \n\
         ip link set \"\$port\" up \n\
-\n\
-        bridge vlan add dev \"\$port\" vid \"\$vlan_id\" pvid untagged \n\
-        echo \"[ACTION] Connected Host Port $port to \$br_name as Access (VLAN \$vlan_id)\" \n\
+        echo \"[ACTION] Connected Host Port \$port to \$br_name\" \n\
     done \n\
 \n\
-    echo \"[STATUS] Bridge \$br_name updated successfully.\" \n\
+    echo \"[STATUS] Bridge \$br_name updated done.\" \n\
     return 0 \n\
 } \n\
 \n\
 echo \"[SYSTEM] Ethernat Bridge Configuration Starting...\" \n\
-setup_evpn_bridge br0 10 eth0 eth1 eth3 \n\
+setup_evpn_bridge br0 10 1.1.1.4 eth0 eth1 eth3 \n\
 echo \"[SYSTEM] Ethernat Bridge Configuration Done.\"\n" > /usr/local/bin/assign-bridge-start
 
 RUN chmod +x /usr/local/bin/assign-bridge-start
@@ -334,7 +333,7 @@ RUN chmod +x /usr/local/bin/assign-udhc-start
 RUN printf "#!/bin/sh\n\
 /usr/local/bin/assign-mac-start \n\
 /usr/local/bin/assign-bridge-start \n\
-/usr/local/bin/assign-udhc-start \n\
+# /usr/local/bin/assign-udhc-start \n\
 echo \"Docker Ethernat Setting Done\n\"\n" > /usr/local/bin/docker-ethernat-start
 
 RUN chmod +x /usr/local/bin/docker-ethernat-start

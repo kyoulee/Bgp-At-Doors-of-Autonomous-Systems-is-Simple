@@ -76,7 +76,6 @@ set_mac() { \n\
     fi \n\
 } \n\
 \n\
-
 set_mac \"42:03:00:01:01:01\" \"eth1\" \n\
 " > /usr/local/bin/assign-mac-start
 
