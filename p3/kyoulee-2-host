@@ -76,7 +76,7 @@ set_mac() { \n\
     fi \n\
 } \n\
 \n\
-set_mac \"42:03:00:01:01:01\" \"eth1\" \n\
+set_mac \"42:03:00:01:02:00\" \"eth0\" \n\
 " > /usr/local/bin/assign-mac-start
 
 RUN chmod +x /usr/local/bin/assign-mac-start
@@ -143,7 +143,7 @@ set_gateway() { \n\
 } \n\
 \n\
 echo \"[SYSTEM] Initializing Network Configuration...\"\n\
-set_ip \"20.1.1.1/24\" \"eth1\" || return 1\n\
+set_ip \"20.1.1.2/24\" \"eth0\" || return 1\n\
 # set_gateway \"20.1.1.254\" || return 1\n\
 echo \"[STATUS] Verification:\"\n\
 log_status ip -4 -o addr show eth1 || echo \"[ERROR] eth1 IPv4 verification failed\"\n\

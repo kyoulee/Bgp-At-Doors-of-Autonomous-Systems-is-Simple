@@ -51,18 +51,18 @@ RUN sed -i 's/zebra=no/zebra=yes/' /etc/frr/daemons && \
 RUN printf "\n\
 frr version 9.1 \n\
 frr default traditional \n\
-hostname kyoulee-2 \n\
+hostname kyoulee-3 \n\
 log syslog informational \n\
 " > /etc/frr/frr.conf
 
 RUN printf "\n\
 ! \n\
 interface lo \n\
-  ip address 1.1.1.2/32 \n\
+  ip address 1.1.1.3/32 \n\
 exit \n\
-interface eth0 \n\
+interface eth1 \n\
   description TO_SPINE_1 \n\
-  ip address 10.1.1.2/30 \n\
+  ip address 10.1.1.6/30 \n\
   no shutdown \n\
 exit \n\
 ! \n\
@@ -71,7 +71,7 @@ exit \n\
 RUN printf "\n\
 ! \n\
 router bgp 65001 \n\
-  bgp router-id 1.1.1.2 \n\
+  bgp router-id 1.1.1.3 \n\
   neighbor 1.1.1.1 remote-as 65001 \n\
   neighbor 1.1.1.1 update-source lo \n\
   address-family ipv4 unicast \n\
@@ -88,12 +88,12 @@ exit \n\
 RUN printf "\n\
 ! \n\
 router ospf \n\
-  ospf router-id 1.1.1.2 \n\
+  ospf router-id 1.1.1.3 \n\
 exit \n\
 interface lo \n\
   ip ospf area 0 \n\
 exit \n\
-interface eth0 \n\
+interface eth1 \n\
   ip ospf area 0 \n\
 exit \n\
 ! \n\
@@ -161,10 +161,10 @@ set_mac() { \n\
     fi \n\
 } \n\
 \n\
-set_mac \"42:03:02:00:03:00\" \"eth0\" \n\
-set_mac \"42:03:02:00:03:01\" \"eth1\" \n\
-set_mac \"42:03:02:00:03:02\" \"eth2\" \n\
-set_mac \"42:03:02:00:03:03\" \"eth3\" \n" > /usr/local/bin/assign-mac-start
+set_mac \"42:03:03:00:03:00\" \"eth0\" \n\
+set_mac \"42:03:03:00:03:01\" \"eth1\" \n\
+set_mac \"42:03:03:00:03:02\" \"eth2\" \n\
+set_mac \"42:03:03:00:03:03\" \"eth3\" \n" > /usr/local/bin/assign-mac-start
 
 RUN chmod +x /usr/local/bin/assign-mac-start
 ################################################################################
@@ -182,9 +182,52 @@ RUN chmod +x /usr/local/bin/assign-mac-start
 #    to prevent breaking network isolation in GNS3/VXLAn environments.
 #  - Detailed Verification: Outputs the final spanning tree/port status.
 ################################################################################
-RUN printf "#!/bin/sh \n\
-/usr/local/bin/common-lib.sh \n\
+RUN printf "#!/bin/sh\n\
+. /usr/local/bin/common-lib.sh\n\
 \n\
+setup_bridge_with_ip_ports () {\n\
+    local br_name=\$1\n\
+    local br_ip_with_mask=\$2\n\
+    local target_ip=\${br_ip_with_mask%%/*}\n\
+    if [ -z \"\$br_name\" ] || [ -z \"\$br_ip_with_mask\" ]; then\n\
+        echo \"[FATAL] Missing arguments! Usage: setup_bridge_with_ip_ports <br_name> <ip/mask> <ports...>\"\n\
+        return 1\n\
+    fi\n\
+    if ! brctl show \"\$br_name\" >/dev/null 2>&1; then\n\
+        brctl addbr \"\$br_name\" || return 1\n\
+    fi\n\
+    ip link set \"\$br_name\" up\n\
+    local current_ipv4=\$(ip -4 -o addr show \"\$br_name\" | awk '{print \$4}')\n\
+    if [ -z \"\$current_ipv4\" ]; then\n\
+        echo \"[ACTION] \$br_name is clean. Assigning \$br_ip_with_mask...\"\n\
+        ip addr add \"\$br_ip_with_mask\" dev \"\$br_name\"\n\
+    elif echo \"\$current_ipv4\" | grep -q \"\$target_ip\"; then\n\
+        echo \"[SKIP] \$br_name already has the target IP \$target_ip.\"\n\
+    else\n\
+        echo \"[FATAL] \$br_name is ALREADY IN USE with: \$current_ipv4\"\n\
+        echo \"[FATAL] Manual intervention required to avoid service disruption.\"\n\
+        return 1\n\
+    fi\n\
+    shift 2\n\
+    for port in \"\$@\"; do\n\
+        if [ ! -d \"/sys/class/net/\$port\" ]; then \n\
+            echo \"[WARN] Interface $port does not exist. Skipping...\" \n\
+            continue; \n\
+        fi \n\
+        if [ -n \"\$(ip -4 -o addr show \"\$port\")\" ]; then \n\
+            echo \"[ERROR] Port \$port has existing config. Skipping to prevent breakage.\" \n\
+            continue; \n\
+        fi \n\
+        if ! brctl show \"\$br_name\" | grep -q \"\$port\"; then \n\
+            brctl addif \"\$br_name\" \"\$port\"\n\
+        fi\n\
+        ip link set \"\$port\" up\n\
+    done\n\
+    echo \"[STATUS] Final Bridge Configuration for: \$br_name\"\n\
+    log_status brctl show \"\$br_name\"\n\
+    log_status ip -4 -o addr show \"\$br_name\"\n\
+    return 0\n\
+}\n\
 setup_evpn_bridge() { \n\
     local br_name=\$1 \n\
     local vlan_id=\$2 \n\
@@ -229,10 +272,9 @@ setup_evpn_bridge() { \n\
     return 0 \n\
 } \n\
 \n\
-echo \"[SYSTEM] Ethernat Bridge Configuration Starting...\"\n\
-setup_evpn_bridge br0 10 1.1.1.2 eth1 eth2 eth3 \n\
-echo \"[SYSTEM] Ethernat Bridge Configuration Done.\"\n\
-" > /usr/local/bin/assign-bridge-start
+echo \"[SYSTEM] Ethernat Bridge Configuration Starting...\" \n\
+setup_evpn_bridge br0 10 1.1.1.3 eth0 eth2 eth3 \n\
+echo \"[SYSTEM] Ethernat Bridge Configuration Done.\"\n" > /usr/local/bin/assign-bridge-start
 
 RUN chmod +x /usr/local/bin/assign-bridge-start
 
