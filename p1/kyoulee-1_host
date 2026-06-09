@@ -1,5 +1,21 @@
+################################################################################
+# STEP: Base Image Selection & Core Network Packages Installation
+#
+# This layer builds the baseline execution environment for the routing container:
+#  - Uses Alpine Linux 3.19 as a verified, secure, and lightweight footprint.
+#  - Installs BusyBox utilities to provide essential CLI debugging tools.
+################################################################################
 FROM alpine:3.19
 
-RUN apk update && apk add --no-cache busybox
+RUN apk update && apk add --no-cache \
+    busybox \
+    busybox-extras
 
+################################################################################
+# STEP: Container Runtime Execution Entrypoint
+#
+# Configures the default executable context for the container runtime:
+#  - Executes '/sbin/tini' as the formal PID 1 initialization daemon.
+#  - Uses the '--' separator to safely isolate and pass execution control.
+################################################################################
 CMD ["/bin/sh"]
