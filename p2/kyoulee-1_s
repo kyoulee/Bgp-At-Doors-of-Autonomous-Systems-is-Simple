@@ -1,9 +1,21 @@
+################################################################################
+# STEP: Base Image Selection & Core Network Packages Installation
+#
+# This layer builds the baseline execution environment for the routing container:
+#  - Uses Alpine Linux 3.19 as a verified, secure, and lightweight footprint.
+#  - Installs FRR (Free Range Routing) for enterprise-grade routing protocols.
+#  - Installs BusyBox utilities to provide essential CLI debugging tools.
+#  - Integrates 'tini' as a minimal init system to safely manage zombie processes
+#    and properly forward OS signals within the container lifecycle.
+################################################################################
 FROM alpine:3.19
 
 RUN apk update && apk add --no-cache \
     frr \
     busybox \
-    tini
+    busybox-extras \
+    tini \
+    tcpdump
 
 ################################################################################
 # STEP: Common Utility Library Initialization
@@ -16,24 +28,30 @@ RUN apk update && apk add --no-cache \
 #   . /usr/local/bin/common-lib.sh
 #   log_status <command> <args>
 ################################################################################
-RUN printf "#!/bin/sh\n\
-log_msg() {\n\
-    local tag=\$1\n\
+RUN printf '#!/bin/sh \n\
+log_msg() { \n\
+    local tag=$1 \n\
 \n\
-    if [ \$# -lt 2 ]; then\n\
-        echo \"[FATAL] Wrong usage of log_msg!\"\n\
-        echo \"[USAGE] log_msg <TAG> <COMMAND> [ARGUMENTS...]\"\n\
-        return 1\n\
-    fi\n\
-    shift\n\
-    \"\$@\" 2>&1 | sed \"s/^/[\$tag] /\"\n\
-}\n\
+    if [ $# -lt 2 ]; then \n\
+        echo "[FATAL] Wrong usage of log_msg!" \n\
+        echo "[USAGE] log_msg <TAG> <COMMAND> [ARGUMENTS...]" \n\
+        return 1 \n\
+    fi \n\
+    shift \n\
+    echo "$@" 2>&1 | sed "s/^/[$tag] /" \n\
+} \n\
 \n\
-log_status() { log_msg \"STATUS\" \"\$@\"; }\n\
-log_init()   { log_msg \"INIT\" \"\$@\"; }\n\
-log_fatal()   { log_msg \"FATAL\" \"\$@\"; }\n\
-log_error()  { log_msg \"ERROR\" \"\$@\"; }\n" > /usr/local/bin/common-lib.sh && \
-chmod +x /usr/local/bin/common-lib.sh
+log_status() { log_msg "STATUS" "$@"; } \n\
+log_init()   { log_msg "INIT" "$@"; } \n\
+log_system() { log_msg "SYSTEM" "$@"; } \n\
+log_action() { log_msg "ACTION" "$@"; } \n\
+log_success(){ log_msg "SUCCESS" "$@"; } \n\
+log_fatal()  { log_msg "FATAL" "$@"; } \n\
+log_error()  { log_msg "ERROR" "$@"; } \n\
+log_warning(){ log_msg "WARNING" "$@"; } \n\
+' > /usr/local/bin/common-lib.sh
+
+RUN chmod +x /usr/local/bin/common-lib.sh
 
 ################################################################################
 # STEP: FRR (Free Range Routing) Service Initialization
@@ -49,77 +67,73 @@ RUN sed -i 's/zebra=no/zebra=yes/' /etc/frr/daemons && \
     sed -i 's/watchfrr_options=.*$/watchfrr_options=""/' /etc/frr/daemons
 
 ################################################################################
-# STEP: Routing Protocol Configuration Setup
-#
-# Initializes empty configuration files for the enabled routing daemons.
-# These files must exist for the FRR services to start correctly and are 
-# expected to be populated during runtime or through volume mounts.
-#
-# Included configs: zebra (core), and vtysh (CLI).
-################################################################################
-RUN touch /etc/frr/zebra.conf \
-    /etc/frr/vtysh.conf
-
-################################################################################
 # STEP: FRR Service Control Script
 #
 # This script encapsulates the launch logic for all FRR routing daemons.
 # Separating this from the main entrypoint allows for cleaner service 
 # management and independent troubleshooting of the routing stack.
 ################################################################################
-RUN printf "#!/bin/sh\n\
+RUN printf '#!/bin/sh\n\
 . /usr/local/bin/common-lib.sh\n\
 \n\
-echo \"[SYSTEM]Launching FRR Routing Stack...\"\n\
-/usr/lib/frr/zebra -d -F traditional -A 127.0.0.1 -s 90000000\n\
-\n\
-echo \"[SUCCESS]All FRR daemons are now running in the background.\"\n" > /usr/local/bin/setup-frr-daemons
+log_system "Launching FRR Routing Stack..." \n\
+/usr/lib/frr/frrinit.sh start \n\
+/usr/lib/frr/frrinit.sh status \n\
+log_success "All FRR daemons are now running in the background." \n\
+' > /usr/local/bin/setup-frr-daemons
 
 RUN chmod +x /usr/local/bin/setup-frr-daemons
 
 ################################################################################
-# STEP: Ethernet Bridge Configuration (Layer 2 Switching)
+# STEP: Ethernet Bridge Configuration and Multi-Interface Binding
 #
-# Provides an idempotent mechanism to create a software bridge and bind
-# multiple interfaces. This script enforces a "Pure L2" policy by avoiding
-# IP assignments on the bridge interface.
+# This script creates a software bridge (Layer 2) and binds multiple physical/
+# virtual interfaces to it. It ensures reliable execution through precise state 
+# validation for each member interface.
+#
+# Key Features:
+#  - Idempotent Bridge Checks: Uses native 'ip link' to prevent duplicating bridges.
+#  - Port Sanitization: Validates the existence of each target interface before 
+#    attempting to attach it to the bridge, preventing script crashes.
 ################################################################################
-RUN printf "#!/bin/sh\n\
-. /usr/local/bin/common-lib.sh\n\
-\n\
-setup_bridge_ports () {\n\
-    local br_name=\$1\n\
-    if [ -z \"\$br_name\" ]; then\n\
-        echo \"[FATAL] Missing arguments! Usage: setup_bridge_ports <br_name> <ports...>\"\n\
-        return 1\n\
-    fi\n\
-    if ! brctl show \"\$br_name\" >/dev/null 2>&1; then\n\
-        brctl addbr \"\$br_name\" || return 1\n\
-    fi\n\
-    ip link set \"\$br_name\" up\n\
-    shift 1\n\
-    for port in \"\$@\"; do\n\
-        if [ ! -d \"/sys/class/net/\$port\" ]; then \n\
-            echo \"[WARN] Interface $port does not exist. Skipping...\" \n\
-            continue; \n\
+RUN printf '#!/bin/sh \n\
+. /usr/local/bin/common-lib.sh \n\
+setup_bridge() { \n\
+    local BR_NAME=$1 \n\
+    shift \n\
+\n\ 
+    log_system "setup_bridge" \n\
+    if ip link show "$BR_NAME" >/dev/null 2>&1; then \n\
+        log_error "$BR_NAME already exists." \n\
+        return 1 \n\
+    fi \n\
+    if ! ip link add "$BR_NAME" type bridge; then \n\
+        log_error "Bridge $BR_NAME not created" && return 2 \n\
+    fi \n\
+    log_status "Created $BR_NAME brige" \n\
+    if ! ip link set dev "$BR_NAME" up; then \n\
+        log_error "$BR_NAME set up fail" && return 2 \n\
+    fi \n\
+    for interface in "$@"; do \n\
+        if ! ip link show "$interface" >/dev/null 2>&1 ; then \n\
+            log_warning "$interface not founded." && continue \n\
         fi \n\
-        if [ -n \"\$(ip -4 -o addr show \"\$port\")\" ]; then \n\
-            echo \"[ERROR] Port \$port has existing config. Skipping to prevent breakage.\" \n\
-            continue; \n\
+        if ! ip link set dev "$interface" master "$BR_NAME"; then \n\
+            log_warning "Failed to set master $interface for $BR_NAME" && continue \n\
         fi \n\
-        if ! brctl show \"\$br_name\" | grep -q \"\$port\"; then \n\
-            brctl addif \"\$br_name\" \"\$port\"\n\
-        fi\n\
-        ip link set \"\$port\" up\n\
-    done\n\
-    echo \"[STATUS] Final Bridge Configuration for: \$br_name\"\n\
-    log_status brctl show \"\$br_name\"\n\
-    return 0\n\
-}\n\
+    done \n\
+    log_success "Setup bridge $BR_NAME $@" \n\
+    return 0 \n\
+} \n\
+setup_bridge br0 eth0 eth1 eth2 eth3 \n\
+RETURN_CODE=$? \n\
 \n\
-echo \"[SYSTEM] Ethernat Bridge Configuration Starting...\"\n\
-setup_bridge_ports br0 eth0 eth1 \n\
-echo \"[SYSTEM] Ethernat Bridge Configuration Done.\"\n" > /usr/local/bin/assign-bridge-start
+[[ $RETURN_CODE -eq 0 ]] && \n\
+    log_system "Bridge Setting Done" || \n\
+    log_error "docker-ethernet-start error" \n\
+\n\
+return $RETURN_CODE \n\
+' > /usr/local/bin/assign-bridge-start
 
 RUN chmod +x /usr/local/bin/assign-bridge-start
 
@@ -130,44 +144,41 @@ RUN chmod +x /usr/local/bin/assign-bridge-start
 # interfaces. It ensures the interface state is managed correctly during 
 # the transition and verifies the hardware presence before execution.
 ################################################################################
-RUN printf "#!/bin/sh \n\
-. /usr/local/bin/common-lib.sh\n\
+RUN printf '#!/bin/sh \n\
+. /usr/local/bin/common-lib.sh \n\
+setup_mac() { \n\
+    local MAC_ADDR=$1 \n\
+    local INTERFACE=$2 \n\
 \n\
-set_mac() { \n\
-    local mac=\$1 \n\
-    local dev=\$2 \n\
-\n\
-    if [ -z \"\$mac\" ] || [ -z \"\$dev\" ]; then \n\
-        echo \"[FATAL] Missing arguments! Usage: set_mac <mac_address> <device_name>\" \n\
-        return 1 \n\
+    log_system "setup_mac" \n\
+    if [ ! -d "/sys/class/net/$INTERFACE" ]; then \n\
+        log_warning "Interface $INTERFACE not found." && return 0 \n\
     fi \n\
-\n\
-    if [ ! -d \"/sys/class/net/\$dev\" ]; then \n\
-        echo \"[FATAL] Interface \$dev not found.\" \n\
-        return 1 \n\
+    if ! ip link set "$INTERFACE" down ; then \n\
+        log_error "Interface $INTERFACE can not setup downlink" && return 0 \n\
     fi \n\
-\n\
-    local current_mac=\$(cat /sys/class/net/\$dev/address) \n\
-    if [ \"\$current_mac\" = \"\$mac\" ]; then \n\
-        echo \"[SKIP] \$dev already has MAC \$mac.\" \n\
-    else \n\
-        echo \"[ACTION] Changing \$dev MAC from \$current_mac to \$mac...\" \n\
-        ip link set \"\$dev\" down \n\
-        if ip link set \"\$dev\" address \"\$mac\"; then \n\
-            ip link set \"\$dev\" up \n\
-            echo \"[SUCCESS] MAC address updated for \$dev.\" \n\
-        else \n\
-            echo \"[ERROR] Failed to set MAC for \$dev. (Check permissions/validity)\" \n\
-            ip link set \"\$dev\" up \n\
-            return 1 \n\
-        fi \n\
+    if ! ip link set "$INTERFACE" address "$MAC_ADDR"; then \n\
+        log_warning "Interface $INTERFACE setting MAC address failed" && return 0 \n\
     fi \n\
+    if ! ip link set "$INTERFACE" up ; then \n\
+        log_error "Interface $INTERFACE can not setup uplink" && return 1 \n\
+    fi \n\
+    return 0 \n\
 } \n\
 \n\
-set_mac \"00:00:00:02:02:00\" \"eth0\" \n\
-set_mac \"00:00:00:02:02:01\" \"eth1\" \n\
-set_mac \"00:00:00:02:02:02\" \"eth2\" \n\
-set_mac \"00:00:00:02:02:03\" \"eth3\" \n" > /usr/local/bin/assign-mac-start
+setup_mac "42:02:02:00:01:00" eth0 && \n\
+setup_mac "42:02:02:00:01:01" eth1 && \n\
+setup_mac "42:02:02:00:01:02" eth2 && \n\
+setup_mac "42:02:02:00:01:03" eth3 \n\
+\n\
+RETURN_CODE=$? \n\
+\n\
+[[ $RETURN_CODE -eq 0 ]] && \n\
+    log_system "VXLAN Setting Done" || \n\
+    log_error "assign-vxlan-start error" \n\
+\n\
+return $RETURN_CODE \n\
+' > /usr/local/bin/assign-mac-start
 
 RUN chmod +x /usr/local/bin/assign-mac-start
 
@@ -178,12 +189,21 @@ RUN chmod +x /usr/local/bin/assign-mac-start
 # 1. Hardware-level identity (MAC) must be established first.
 # 2. Logical Layer 2 topology (Bridge) is constructed thereafter.
 ################################################################################
-RUN printf "#!/bin/sh\n\
+RUN printf '#!/bin/sh \n\
+. /usr/local/bin/common-lib.sh \n\
+/usr/local/bin/assign-mac-start && \n\
 /usr/local/bin/assign-bridge-start \n\
-/usr/local/bin/assign-mac-start \n\
-echo \"Docker Ethernat Setting Done\n\"\n" > /usr/local/bin/docker-ethernat-start
+\n\
+RETURN_CODE=$? \n\
+\n\
+[[ $RETURN_CODE -eq 0 ]] && \n\
+    log_system "Docker Ethernat Setting Done" || \n\
+    log_error "docker-ethernet-start error" \n\
+\n\
+return $RETURN_CODE \n\
+' > /usr/local/bin/docker-ethernet-start
 
-RUN chmod +x /usr/local/bin/docker-ethernat-start
+RUN chmod +x /usr/local/bin/docker-ethernet-start
 
 ################################################################################
 # STEP: Container Runtime Entrypoint Orchestrator
@@ -193,12 +213,12 @@ RUN chmod +x /usr/local/bin/docker-ethernat-start
 # before launching the routing management daemon (Zebra).
 #
 # Execution Flow:
-#  1. Infrastructure Setup: Invokes docker-ethernat-start for MAC/Bridge config.
+#  1. Infrastructure Setup: Invokes docker-ethernet-start for MAC/Bridge config.
 #  2. Daemon Launch: Starts the FRR Zebra daemon for interface management.
 #  3. Persistence: Enters an interactive shell loop for debugging and stability.
 ################################################################################
 RUN printf "#!/bin/sh\n\
-/usr/local/bin/docker-ethernat-start\n\
+/usr/local/bin/docker-ethernet-start\n\
 /usr/local/bin/setup-frr-daemons \n\
 while true; do /bin/busybox sh ; done \n\
 tail -f /dev/null\n" > /usr/lib/frr/docker-start
