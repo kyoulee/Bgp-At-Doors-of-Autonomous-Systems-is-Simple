@@ -1,9 +1,17 @@
+################################################################################
+# STEP: Base Image Selection & Core Network Packages Installation
+#
+# This layer builds the baseline execution environment for the routing container:
+#  - Uses Alpine Linux 3.19 as a verified, secure, and lightweight footprint.
+#  - Installs BusyBox utilities to provide essential CLI debugging tools.
+################################################################################
 FROM alpine:3.19
 
 RUN apk update && apk add --no-cache \
     busybox \
     busybox-extras \
-    tini
+    tini \
+    tcpdump
 
 ################################################################################
 # STEP: Common Utility Library Initialization
@@ -16,24 +24,30 @@ RUN apk update && apk add --no-cache \
 #   . /usr/local/bin/common-lib.sh
 #   log_status <command> <args>
 ################################################################################
-RUN printf "#!/bin/sh\n\
-log_msg() {\n\
-    local tag=\$1\n\
+RUN printf '#!/bin/sh \n\
+log_msg() { \n\
+    local tag=$1 \n\
 \n\
-    if [ \$# -lt 2 ]; then\n\
-        echo \"[FATAL] Wrong usage of log_msg!\"\n\
-        echo \"[USAGE] log_msg <TAG> <COMMAND> [ARGUMENTS...]\"\n\
-        return 1\n\
-    fi\n\
-    shift\n\
-    \"\$@\" 2>&1 | sed \"s/^/[\$tag] /\"\n\
-}\n\
+    if [ $# -lt 2 ]; then \n\
+        echo "[FATAL] Wrong usage of log_msg!" \n\
+        echo "[USAGE] log_msg <TAG> <COMMAND> [ARGUMENTS...]" \n\
+        return 1 \n\
+    fi \n\
+    shift \n\
+    echo "$@" 2>&1 | sed "s/^/[$tag] /" \n\
+} \n\
 \n\
-log_status() { log_msg \"STATUS\" \"\$@\"; }\n\
-log_init()   { log_msg \"INIT\" \"\$@\"; }\n\
-log_fatal()   { log_msg \"FATAL\" \"\$@\"; }\n\
-log_error()  { log_msg \"ERROR\" \"\$@\"; }\n" > /usr/local/bin/common-lib.sh && \
-chmod +x /usr/local/bin/common-lib.sh
+log_status() { log_msg "STATUS" "$@"; } \n\
+log_init()   { log_msg "INIT" "$@"; } \n\
+log_system() { log_msg "SYSTEM" "$@"; } \n\
+log_action() { log_msg "ACTION" "$@"; } \n\
+log_success(){ log_msg "SUCCESS" "$@"; } \n\
+log_fatal()  { log_msg "FATAL" "$@"; } \n\
+log_error()  { log_msg "ERROR" "$@"; } \n\
+log_warning(){ log_msg "WARNING" "$@"; } \n\
+' > /usr/local/bin/common-lib.sh
+
+RUN chmod +x /usr/local/bin/common-lib.sh
 
 ################################################################################
 # STEP: MAC Address Configuration Utility
@@ -42,182 +56,125 @@ chmod +x /usr/local/bin/common-lib.sh
 # interfaces. It ensures the interface state is managed correctly during 
 # the transition and verifies the hardware presence before execution.
 ################################################################################
-RUN printf "#!/bin/sh \n\
-. /usr/local/bin/common-lib.sh\n\
+RUN printf '#!/bin/sh \n\
+. /usr/local/bin/common-lib.sh \n\
+setup_mac() { \n\
+    local MAC_ADDR=$1 \n\
+    local INTERFACE=$2 \n\
 \n\
-set_mac() { \n\
-    local mac=\$1 \n\
-    local dev=\$2 \n\
-\n\
-    if [ -z \"\$mac\" ] || [ -z \"\$dev\" ]; then \n\
-        echo \"[FATAL] Missing arguments! Usage: set_mac <mac_address> <device_name>\" \n\
-        return 1 \n\
+    log_system "setup_mac" \n\
+    if [ ! -d "/sys/class/net/$INTERFACE" ]; then \n\
+        log_warning "Interface $INTERFACE not found." && return 0 \n\
     fi \n\
-\n\
-    if [ ! -d \"/sys/class/net/\$dev\" ]; then \n\
-        echo \"[FATAL] Interface \$dev not found.\" \n\
-        return 1 \n\
+    if ! ip link set "$INTERFACE" down ; then \n\
+        log_error "Interface $INTERFACE can not setup downlink" && return 0 \n\
     fi \n\
-\n\
-    local current_mac=\$(cat /sys/class/net/\$dev/address) \n\
-    if [ \"\$current_mac\" = \"\$mac\" ]; then \n\
-        echo \"[SKIP] \$dev already has MAC \$mac.\" \n\
-    else \n\
-        echo \"[ACTION] Changing \$dev MAC from \$current_mac to \$mac...\" \n\
-        ip link set \"\$dev\" down \n\
-        if ip link set \"\$dev\" address \"\$mac\"; then \n\
-            ip link set \"\$dev\" up \n\
-            echo \"[SUCCESS] MAC address updated for \$dev.\" \n\
-        else \n\
-            echo \"[ERROR] Failed to set MAC for \$dev. (Check permissions/validity)\" \n\
-            ip link set \"\$dev\" up \n\
-            return 1 \n\
-        fi \n\
+    if ! ip link set "$INTERFACE" address "$MAC_ADDR"; then \n\
+        log_warning "Interface $INTERFACE setting MAC address failed" && return 0 \n\
     fi \n\
+    if ! ip link set "$INTERFACE" up ; then \n\
+        log_error "Interface $INTERFACE can not setup uplink" && return 1 \n\
+    fi \n\
+    return 0 \n\
 } \n\
 \n\
-set_mac \"42:03:00:01:02:00\" \"eth0\" \n\
-" > /usr/local/bin/assign-mac-start
+setup_mac "42:03:01:00:02:00" eth0 && \n\
+setup_mac "42:03:01:00:02:01" eth1 \n\
+\n\
+RETURN_CODE=$? \n\
+\n\
+[[ $RETURN_CODE -eq 0 ]] && \n\
+    log_system "MAC Setting Done" || \n\
+    log_error "assign-mac-start error" \n\
+\n\
+return $RETURN_CODE \n\
+' > /usr/local/bin/assign-mac-start
 
 RUN chmod +x /usr/local/bin/assign-mac-start
+
 ################################################################################
 # STEP: Network Interface Configuration
 #
 # Automates the setup of IP addresses and routing tables.
-# Uses idempotent functions (set_ip, set_gateway) to prevent redundant
+# Uses idempotent functions (setup_interface_ip) to prevent redundant
 # configurations and ensure the system state remains consistent.
 ################################################################################
-RUN printf "#!/bin/sh \n\
+RUN printf '#!/bin/sh \n\
 . /usr/local/bin/common-lib.sh\n\
 \n\
-set_ip() { \n\
-    local ip=\$1 \n\
-    local dev=\$2 \n\
-    local target_ip=\${ip%%/*} \n\
+setup_interface_ip() { \n\
+    local LOOPBACK_IP=$1 \n\
+    local INTERFACE=$2 \n\
 \n\
-    if [ -z \"\$ip\" ] || [ -z \"\$dev\" ]; then \n\
-        echo \"[FATAL] Missing arguments! Usage: set_ip <ip/mask> <device_name>\" \n\
-        return 1 \n\
+    log_system "setup_interface_ip" \n\
+    if ! ip link show "$INTERFACE" >/dev/null 2>&1; then \n\
+        log_error "Interface $INTERFACE not found" && return 2 \n\
     fi \n\
-    if [ ! -d \"/sys/class/net/\$dev\" ]; then \n\
-        echo \"[FATAL] Interface \$dev not found.\" \n\
-        return 1 \n\
+    if ip addr show dev "$INTERFACE" | grep -Fq "$LOOPBACK_IP"; then \n\
+        log_warning "IP $LOOPBACK_IP is already assigned to $INTERFACE." && return 0 \n\ \n\
     fi \n\
-    local current_ipv4=\$(ip -4 -o addr show \"\$dev\" | awk '{print \$4}') \n\
-    if [ -z \"\$current_ipv4\" ]; then \n\
-        echo \"[ACTION] \$dev is clean. Assigning \$ip...\" \n\
-        ip addr add \"\$ip\" dev \"\$dev\" && ip link set \"\$dev\" up \n\
-    elif echo \"\$current_ipv4\" | grep -q \"\$target_ip\"; then \n\
-        echo \"[SKIP] \$dev already has the target IP \$target_ip.\" \n\
-        ip link set \"\$dev\" up \n\
-    else \n\
-        echo \"[FATAL] \$dev has CONFLICTING config: \$current_ipv4\" \n\
-        echo \"[FATAL] Automatic flush is disabled for safety. Manual check required.\" \n\
-        return 1 \n\
+    if ! ip addr add "$LOOPBACK_IP" dev "$INTERFACE"; then \n\
+        log_error "Failed to add IP $LOOPBACK_IP to $INTERFACE" && return 2 \n\
     fi \n\
+    ip link set "$INTERFACE" up \n\
+    log_success "Successfully assigned $LOOPBACK_IP to $INTERFACE" \n\
+    return 0 \n\
 } \n\
+setup_interface_ip 20.1.1.2/24 eth0 \n\
 \n\
-set_gateway() { \n\
-    local gw=\$1 \n\
-\n\    
-    if [ -z \"\$gw\" ]; then \n\
-        echo \"[FATAL] Missing arguments! Usage: set_gateway <gateway_ip>\" \n\
-        return 1 \n\
-    fi \n\
-    local current_gw=\$(ip route show default | awk '/default via/ {print \$3}') \n\
-    if [ \"\$current_gw\" = \"\$gw\" ]; then \n\
-        echo \"[SKIP] Default gateway is already set to \$gw.\" \n\
-    elif [ -z \"\$current_gw\" ]; then \n\
-        echo \"[ACTION] No default gateway found. Setting to \$gw...\" \n\
-        if ip route add default via \"\$gw\"; then \n\
-            echo \"[SUCCESS] Default gateway is now \$gw\" \n\
-        else \n\
-            echo \"[ERROR] Failed to set gateway \$gw. (Check reachability)\" \n\
-            return 1 \n\
-        fi \n\
-    else \n\
-        echo \"[FATAL] Default gateway CONFLICT: Current is \$current_gw, Target is \$gw\" \n\
-        echo \"[FATAL] Automatic override is disabled for safety. Manual intervention required.\" \n\
-        return 1 \n\
-    fi \n\
-} \n\
+RETURN_CODE=$? \n\
 \n\
-echo \"[SYSTEM] Initializing Network Configuration...\"\n\
-set_ip \"20.1.1.2/24\" \"eth0\" || return 1\n\
-# set_gateway \"20.1.1.254\" || return 1\n\
-echo \"[STATUS] Verification:\"\n\
-log_status ip -4 -o addr show eth1 || echo \"[ERROR] eth1 IPv4 verification failed\"\n\
-# ip route | grep default || echo \"[ERROR] Gateway verification failed\"\n\
-echo \"[SUCCESS] All network configurations applied.\"\n" > /usr/local/bin/assign-ip-start
+[[ $RETURN_CODE -eq 0 ]] && \n\
+    log_system "Interface IP Setting Done" || \n\
+    log_error "docker-ip-start error" \n\
+\n\
+return $RETURN_CODE \n\
+' > /usr/local/bin/assign-ip-start
 
 RUN chmod +x /usr/local/bin/assign-ip-start
 
 ################################################################################
-# STEP: DHCP Service Initialization
+# STEP: Network Orchestration Entrypoint
 #
-# This script provides a modular and idempotent mechanism to enable DHCP for 
-# specified network interfaces. It abstracts the configuration logic by 
-# parsing and activating entries within '/etc/network/interfaces'.
-#
-# Key Features:
-#  1. Dynamic Interface Targeting: Uses a functional approach to configure 
-#     arbitrary interfaces (e.g., eth0, br0).
-#  2. Fail-Fast Integrity Check: Validates the existence of the configuration 
-#     file and target interface before applying changes.
-#  3. Standardized Logging: Integrates with 'common-lib.sh' to provide 
-#     consistent observability across the network setup process.
+# This script acts as a secondary entrypoint to orchestrate multiple network
+# setup scripts (e.g., assign-ip-start). It ensures that all Ethernet-related
+# configurations are executed in the correct sequence before the main process.
 #
 # Usage:
-#   setup_dhcp_interface <interface_name>
+#   Called internally by /usr/local/bin/docker-start
 ################################################################################
-RUN printf "#!/bin/sh \n\
-sed -i -r 's/^#*[[:space:]]*auto_time[[:space:]]+.*/auto_time 60/' /etc/network/interfaces && \
-" > /usr/local/bin/assign-udhc-start
-
-RUN chmod +x /usr/local/bin/assign-udhc-start
-
-################################################################################
-# STEP: Ethernet & VXLAN Infrastructure Orchestration
-#
-# This script orchestrates the sequential setup of network infrastructure layers.
-# It ensures that local bridging (Layer 2) is established before initializing 
-# VXLAN tunneling (Overlay), following a strictly ordered initialization pattern.
-#
-# Execution Flow:
-#  1. Local Bridge Setup: Configures br0 and binds physical/virtual interfaces.
-#  2. VXLAN Tunneling: Establishes remote L2-over-L3 connectivity.
-#  3. Final Validation: Signals the completion of the network stack.
-################################################################################
-RUN printf "#!/bin/sh\n\
+RUN printf '#!/bin/sh\n\
+. /usr/local/bin/common-lib.sh \n\
 /usr/local/bin/assign-mac-start \n\
 /usr/local/bin/assign-ip-start \n\
-/usr/local/bin/assign-udhc-start \n\
-echo \"Docker Ethernat Setting Done\n\"\n" > /usr/local/bin/docker-ethernat-start
+\n\
+RETURN_CODE=$? \n\
+\n\
+[[ $RETURN_CODE -eq 0 ]] && \n\
+    log_system "Docker Ethernat Setting Done" || \n\
+    log_error "docker-ethernet-start error" \n\
+\n\
+return $RETURN_CODE \n\
+' > /usr/local/bin/docker-ethernet-start
 
-RUN chmod +x /usr/local/bin/docker-ethernat-start
+RUN chmod +x /usr/local/bin/docker-ethernet-start
 
 ################################################################################
-# STEP: Master System Entrypoint & Service Orchestration
+# STEP: Main Container Entrypoint
 #
-# This script serves as the primary PID 1 process (or its proxy) for the 
-# container. It follows a strictly ordered initialization sequence to ensure 
-# architectural integrity:
-#
-# Sequence:
-#  1. Infrastructure Layer: Invokes 'docker-ethernat-start' to configure 
-#     local bridges and VXLAN tunnels.
-#  2. Routing Layer: Invokes 'setup-frr-daemons' to launch the core routing 
-#     stack (Zebra, BGP, etc.) once the network substrate is ready.
-#  3. Interaction Layer: Spawns an infinite busybox shell loop for 
-#     administrative access and container persistence.
-#
-# Design Note: Includes a 'tail -f /dev/null' safety lock to prevent 
-# unexpected container termination.
+# This script serves as the final entrypoint for the container. It orchestrates
+# the network initialization sequence and ensures the container remains active.
+# 
+# The design follows the "Keep-Alive" pattern:
+#  1. Executes the network orchestration script.
+#  2. Enters an infinite loop to provide an interactive shell environment.
+#  3. Falls back to 'tail -f' to prevent container exit if the shell terminates.
 ################################################################################
-RUN printf "#!/bin/sh\n\
-/usr/local/bin/docker-ethernat-start \n\
+RUN printf '#!/bin/sh \n\
+/usr/local/bin/docker-ethernet-start \n\
 while true; do /bin/busybox sh ; done \n\
-tail -f /dev/null\n" > /usr/local/bin/docker-start
+tail -f /dev/null \n\
+' > /usr/local/bin/docker-start
 
 RUN chmod +x /usr/local/bin/docker-start
 
