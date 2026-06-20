@@ -1,0 +1,390 @@
+################################################################################
+# STEP: Base Image Selection & Core Network Packages Installation
+#
+# This layer builds the baseline execution environment for the routing container:
+#  - Uses Alpine Linux 3.19 as a verified, secure, and lightweight footprint.
+#  - Installs FRR (Free Range Routing) for enterprise-grade routing protocols.
+#  - Installs BusyBox utilities to provide essential CLI debugging tools.
+#  - Integrates 'tini' as a minimal init system to safely manage zombie processes
+#    and properly forward OS signals within the container lifecycle.
+################################################################################
+FROM alpine:3.19
+
+RUN apk update && apk add --no-cache \
+    frr \
+    busybox \
+    busybox-extras \
+    tini \
+    tcpdump
+
+################################################################################
+# STEP: Common Utility Library Initialization
+#
+# This layer creates a shared shell library to standardize logging formats.
+# It implements a [TAG] messaging pattern to ensure consistent observability
+# across all subsequent scripts and configurations.
+#
+# Usage:
+#   . /usr/local/bin/common-lib.sh
+#   log_status <command> <args>
+################################################################################
+RUN printf '#!/bin/sh \n\
+log_msg() { \n\
+    local tag=$1 \n\
+\n\
+    if [ $# -lt 2 ]; then \n\
+        echo "[FATAL] Wrong usage of log_msg!" \n\
+        echo "[USAGE] log_msg <TAG> <COMMAND> [ARGUMENTS...]" \n\
+        return 1 \n\
+    fi \n\
+    shift \n\
+    echo "$@" 2>&1 | sed "s/^/[$tag] /" \n\
+} \n\
+\n\
+log_status() { log_msg "STATUS" "$@"; } \n\
+log_init()   { log_msg "INIT" "$@"; } \n\
+log_system() { log_msg "SYSTEM" "$@"; } \n\
+log_action() { log_msg "ACTION" "$@"; } \n\
+log_success(){ log_msg "SUCCESS" "$@"; } \n\
+log_fatal()  { log_msg "FATAL" "$@"; } \n\
+log_error()  { log_msg "ERROR" "$@"; } \n\
+log_warning(){ log_msg "WARNING" "$@"; } \n\
+' > /usr/local/bin/common-lib.sh
+
+RUN chmod +x /usr/local/bin/common-lib.sh
+
+################################################################################
+# STEP: FRR Daemon Activation & Configuration Initialization
+#
+# This step pre-configures the FRR environment prior to the service launch:
+#  1. Modifies '/etc/frr/daemons' to explicitly enable routing protocols 
+#     (Zebra, BGP, OSPF, IS-IS) and disables the 'watchfrr' supervisor 
+#     to hand over execution control to the container entrypoint.
+#  2. Generates baseline configuration stub files required by the FRR 
+#     daemons to prevent initialization failures during boot.
+################################################################################
+RUN sed -i 's/zebra=no/zebra=yes/' /etc/frr/daemons && \
+    sed -i 's/bgpd=no/bgpd=yes/' /etc/frr/daemons && \
+    sed -i 's/ospfd=no/ospfd=yes/' /etc/frr/daemons && \
+    sed -i 's/isisd=no/isisd=yes/' /etc/frr/daemons && \
+    sed -i 's/watchfrr_options=.*$/watchfrr_options=""/' /etc/frr/daemons
+
+################################################################################
+# STEP: FRR Service Control Script
+#
+# This script encapsulates the launch logic for all FRR routing daemons.
+# Separating this from the main entrypoint allows for cleaner service 
+# management and independent troubleshooting of the routing stack.
+################################################################################
+RUN printf '#!/bin/sh\n\
+. /usr/local/bin/common-lib.sh\n\
+\n\
+log_system "Launching FRR Routing Stack..." \n\
+/usr/lib/frr/frrinit.sh start \n\
+/usr/lib/frr/frrinit.sh status \n\
+log_success "All FRR daemons are now running in the background." \n\
+' > /usr/local/bin/setup-frr-daemons
+
+RUN chmod +x /usr/local/bin/setup-frr-daemons
+
+################################################################################
+# STEP: Ethernet Bridge Configuration and Multi-Interface Binding
+#
+# This script creates a software bridge (Layer 2) and binds multiple physical/
+# virtual interfaces to it. It ensures reliable execution through precise state 
+# validation for each member interface.
+#
+# Key Features:
+#  - Idempotent Bridge Checks: Uses native 'ip link' to prevent duplicating bridges.
+#  - Port Sanitization: Validates the existence of each target interface before 
+#    attempting to attach it to the bridge, preventing script crashes.
+################################################################################
+
+RUN printf '#!/bin/sh \n\
+. /usr/local/bin/common-lib.sh \n\
+setup_bridge() { \n\
+    local BR_NAME=$1 \n\
+    shift \n\
+\n\ 
+    log_system "setup_bridge" \n\
+    if ip link show "$BR_NAME" >/dev/null 2>&1; then \n\
+        log_error "$BR_NAME already exists." \n\
+        return 1 \n\
+    fi \n\
+    if ! ip link add "$BR_NAME" type bridge; then \n\
+        log_error "Bridge $BR_NAME not created" && return 2 \n\
+    fi \n\
+    log_status "Created $BR_NAME brige" \n\
+    if ! ip link set dev "$BR_NAME" up; then \n\
+        log_error "$BR_NAME set up fail" && return 2 \n\
+    fi \n\
+    for interface in "$@"; do \n\
+        if ! ip link show "$interface" >/dev/null 2>&1 ; then \n\
+            log_warning "$interface not founded." && continue \n\
+        fi \n\
+        if ! ip link set dev "$interface" master "$BR_NAME"; then \n\
+            log_warning "Failed to set master $interface for $BR_NAME" && continue \n\
+        fi \n\
+    done \n\
+    log_success "Setup bridge $BR_NAME $@" \n\
+    return 0 \n\
+} \n\
+setup_bridge br0 eth1 eth2 eth3 \n\
+RETURN_CODE=$? \n\
+\n\
+[[ $RETURN_CODE -eq 0 ]] && \n\
+    log_system "Bridge Setting Done" || \n\
+    log_error "docker-ethernet-start error" \n\
+\n\
+return $RETURN_CODE \n\
+' > /usr/local/bin/assign-bridge-start
+
+RUN chmod +x /usr/local/bin/assign-bridge-start
+
+################################################################################
+# STEP: VXLAN Overlay Network and Bridge Binding Configuration
+#
+# This script establishes a high-performance VXLAN overlay tunnel (Layer 2 over 
+# Layer 3) and integrates it into a local software bridge (br0). It enables 
+# seamless, cross-host container communication across distinct physical nodes.
+#
+# Key Features:
+#  - Idempotent VXLAN Provisioning: Avoids interface duplication by validating 
+#    pre-existing tunnel endpoints with native 'ip link' checks.
+#  - Network Optimization & Acceleration: Explicitly configures UDP checksums 
+#    (udpcsum) and disables IPv6 zero checksum constraints (noudp6zerocsumtx/rx) 
+#    to drastically reduce encapsulation overhead and boost throughput.
+#  - Robust Multi-Component Validation: Ensures that both physical interfaces and 
+#    target software bridges exist and are healthy before committing tunnel attachments.
+################################################################################
+
+RUN printf '#!/bin/sh \n\
+. /usr/local/bin/common-lib.sh \n\
+setup_vxlan() { \n\
+    local INTERFACE=$1 \n\
+    local VNI=$2 \n\
+    local VXLAN_NAME="vxlan$VNI" \n\
+\n\
+    log_system "setup_vxlan" \n\
+    if ! ip link show "$INTERFACE" >/dev/null 2>&1; then \n\
+        log_error "Interface $INTERFACE not founded" && return 2 \n\
+    fi \n\
+    if ip link show "$VXLAN_NAME" >/dev/null 2>&1; then \n\
+        log_error "VXLAN $VXLAN_NAME already exists." && return 2 \n\
+    fi \n\
+    if ! ip link add "$VXLAN_NAME" type vxlan \
+    dev "$INTERFACE" \
+    id "$VNI" \
+    group 239.1.1.1 \
+    dstport 4789 \
+    udpcsum noudp6zerocsumtx noudp6zerocsumrx ; then \n\
+        log_error "VXLAN $VXLAN_NAME Created fail" && return 2 \n\
+    fi \n\
+    log_status "Created vxlan $VXLAN_NAME" \n\
+    if ! ip link set dev "$VXLAN_NAME" up; then \n\
+        log_error "$VXLAN_NAME set up fail" && return 2 \n\
+    fi \n\
+    log_success "Setup VXLAN $VXLAN_NAME" \n\
+    return 0 \n\
+} \n\
+setup_vxlan_bridge() { \n\
+    local VXLAN_NAME=$1 \n\
+    local BR_NAME=$2 \n\
+\n\
+    log_system "setup_vxlan_bridge" \n\
+    if ! ip link show "$VXLAN_NAME" >/dev/null 2>&1; then \n\
+        log_error "VXLAN $VXLAN_NAME not founded" && return 2 \n\
+    fi \n\
+    if ! ip link show "$BR_NAME" >/dev/null 2>&1; then \n\
+        log_error "Bridge $BR_NAME not founded" && return 2 \n\
+    fi \n\
+    if ! ip link set dev "$VXLAN_NAME" master "$BR_NAME"; then \n\
+        log_error "Failed to set master $BR_NAME for $VXLAN_NAME"&& return 2  \n\
+    fi \n\
+    log_success "Setup VXLAN bridge connected $VXLAN_NAME to $BR_NAME" \n\
+    return 0 \n\
+} \n\
+\n\
+setup_vxlan eth0 10 && \n\
+setup_vxlan_bridge vxlan10 br0 \n\
+\n\
+RETURN_CODE=$? \n\
+\n\
+[[ $RETURN_CODE -eq 0 ]] && \n\
+    log_system "VXLAN Setting Done" || \n\
+    log_error "assign-vxlan-start error" \n\
+\n\
+return $RETURN_CODE \n\
+' > /usr/local/bin/assign-vxlan-start
+
+RUN chmod +x /usr/local/bin/assign-vxlan-start
+
+
+################################################################################
+# STEP: Network Interface Configuration
+#
+# Automates the setup of IP addresses and routing tables.
+# Uses idempotent functions (setup_interface_ip) to prevent redundant
+# configurations and ensure the system state remains consistent.
+################################################################################
+RUN printf '#!/bin/sh \n\
+. /usr/local/bin/common-lib.sh\n\
+\n\
+setup_interface_ip() { \n\
+    local LOOPBACK_IP=$1 \n\
+    local INTERFACE=$2 \n\
+\n\
+    log_system "setup_interface_ip" \n\
+    if ! ip link show "$INTERFACE" >/dev/null 2>&1; then \n\
+        log_error "Interface $INTERFACE not found" && return 2 \n\
+    fi \n\
+    if ip addr show dev "$INTERFACE" | grep -Fq "$LOOPBACK_IP"; then \n\
+        log_warning "IP $LOOPBACK_IP is already assigned to $INTERFACE." && return 0 \n\ \n\
+    fi \n\
+    if ! ip addr add "$LOOPBACK_IP" dev "$INTERFACE"; then \n\
+        log_error "Failed to add IP $LOOPBACK_IP to $INTERFACE" && return 2 \n\
+    fi \n\
+    ip link set "$INTERFACE" up \n\
+    log_success "Successfully assigned $LOOPBACK_IP to $INTERFACE" \n\
+    return 0 \n\
+} \n\
+setup_interface_ip 10.1.1.2/32 lo \n\
+' > /usr/local/bin/assign-ip-start
+
+RUN chmod +x /usr/local/bin/assign-ip-start
+
+################################################################################
+# STEP: Network Route Configuration
+#
+# Automates the setup of routing tables with idempotency and verification
+################################################################################
+RUN printf '#!/bin/sh \n\
+. /usr/local/bin/common-lib.sh\n\
+\n\
+setup_route_ip() { \n\
+    local TARGET_PREFIX=$1 \n\
+    local INTERFACE=$2 \n\
+\n\
+    log_system "setup_route_ip" \n\
+    if ! ip link show "$INTERFACE" >/dev/null 2>&1; then \n\
+        log_error "Routing target interface $INTERFACE not found" && return 2 \n\
+    fi \n\
+    if ip route show | grep -Fq "$TARGET_PREFIX dev $INTERFACE"; then \n\
+        log_warning "Route for $TARGET_PREFIX via $INTERFACE alread exist." && return 0 \n\
+    fi \n\
+    if ! ip route add "$TARGET_PREFIX" dev "$INTERFACE"; then \n\
+        log_error "Failed to add route for $TARGET_PREFIX via $INTERFACE" && return 2 \n\
+    fi \n\
+    log_success "Succesesfully added route for $TARGET_PREFIX via $INTERFACE" \n\
+    return 0 \n\
+} \n\
+setup_route_ip 10.1.1.0/24 eth0 \n\
+setup_route_ip 30.1.1.0/24 br0 \n\
+' > /usr/local/bin/assign-route-start
+
+RUN chmod +x /usr/local/bin/assign-route-start
+
+################################################################################
+# STEP: MAC Address Configuration Utility
+#
+# Provides an idempotent way to set hardware (MAC) addresses for network 
+# interfaces. It ensures the interface state is managed correctly during 
+# the transition and verifies the hardware presence before execution.
+################################################################################
+RUN printf '#!/bin/sh \n\
+. /usr/local/bin/common-lib.sh \n\
+setup_mac() { \n\
+    local MAC_ADDR=$1 \n\
+    local INTERFACE=$2 \n\
+\n\
+    log_system "setup_mac" \n\
+    if [ ! -d "/sys/class/net/$INTERFACE" ]; then \n\
+        log_warning "Interface $INTERFACE not found." && return 0 \n\
+    fi \n\
+    if ! ip link set "$INTERFACE" down ; then \n\
+        log_error "Interface $INTERFACE can not setup downlink" && return 0 \n\
+    fi \n\
+    if ! ip link set "$INTERFACE" address "$MAC_ADDR"; then \n\
+        log_warning "Interface $INTERFACE setting MAC address failed" && return 0 \n\
+    fi \n\
+    if ! ip link set "$INTERFACE" up ; then \n\
+        log_error "Interface $INTERFACE can not setup uplink" && return 1 \n\
+    fi \n\
+    return 0 \n\
+} \n\
+\n\
+setup_mac "42:02:03:00:02:00" eth0 && \n\
+setup_mac "42:02:03:00:02:01" eth1 && \n\
+setup_mac "42:02:03:00:02:02" eth2 && \n\
+setup_mac "42:02:03:00:02:03" eth3 \n\
+\n\
+RETURN_CODE=$? \n\
+\n\
+[[ $RETURN_CODE -eq 0 ]] && \n\
+    log_system "VXLAN Setting Done" || \n\
+    log_error "assign-vxlan-start error" \n\
+\n\
+return $RETURN_CODE \n\
+' > /usr/local/bin/assign-mac-start
+
+RUN chmod +x /usr/local/bin/assign-mac-start
+
+################################################################################
+# STEP: Ethernet & VXLAN Infrastructure Orchestration
+#
+# This script orchestrates the sequential setup of network infrastructure layers.
+# It ensures that local bridging (Layer 2) is established before initializing 
+# VXLAN tunneling (Overlay), following a strictly ordered initialization pattern.
+#
+# Execution Flow:
+#  1. Local Bridge Setup: Configures br0 and binds physical/virtual interfaces.
+#  2. VXLAN Tunneling: Establishes remote L2-over-L3 connectivity.
+#  3. Final Validation: Signals the completion of the network stack.
+################################################################################
+RUN printf '#!/bin/sh \n\
+. /usr/local/bin/common-lib.sh \n\
+/usr/local/bin/assign-mac-start && \n\
+/usr/local/bin/assign-ip-start && \n\
+/usr/local/bin/assign-bridge-start && \n\
+/usr/local/bin/assign-vxlan-start && \n\
+/usr/local/bin/assign-route-start \n\
+\n\
+RETURN_CODE=$? \n\
+\n\
+[[ $RETURN_CODE -eq 0 ]] && \n\
+    log_system "Docker Ethernat Setting Done" || \n\
+    log_error "docker-ethernet-start error" \n\
+\n\
+return $RETURN_CODE \n\
+' > /usr/local/bin/docker-ethernet-start
+
+RUN chmod +x /usr/local/bin/docker-ethernet-start
+
+################################################################################
+# STEP: Master System Entrypoint & Service Orchestration
+#
+# This script serves as the primary PID 1 process (or its proxy) for the 
+# container. It follows a strictly ordered initialization sequence to ensure 
+# architectural integrity:
+#
+# Sequence:
+#  1. Infrastructure Layer: Invokes 'docker-ethernet-start' to configure 
+#     local bridges and VXLAN tunnels.
+#  2. Routing Layer: Invokes 'setup-frr-daemons' to launch the core routing 
+#     stack (Zebra, BGP, etc.) once the network substrate is ready.
+#  3. Interaction Layer: Spawns an infinite busybox shell loop for 
+#     administrative access and container persistence.
+#
+# Design Note: Includes a 'tail -f /dev/null' safety lock to prevent 
+# unexpected container termination.
+################################################################################
+RUN printf '#!/bin/sh \n\
+/usr/local/bin/docker-ethernet-start && \n\
+/usr/local/bin/setup-frr-daemons \n\
+while true; do /bin/busybox sh ; done \n\
+tail -f /dev/null \n\
+' > /usr/lib/frr/docker-start
+
+RUN chmod +x /usr/lib/frr/docker-start
+
+CMD ["/sbin/tini", "--", "/usr/lib/frr/docker-start"]

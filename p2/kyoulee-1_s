@@ -1,0 +1,228 @@
+################################################################################
+# STEP: Base Image Selection & Core Network Packages Installation
+#
+# This layer builds the baseline execution environment for the routing container:
+#  - Uses Alpine Linux 3.19 as a verified, secure, and lightweight footprint.
+#  - Installs FRR (Free Range Routing) for enterprise-grade routing protocols.
+#  - Installs BusyBox utilities to provide essential CLI debugging tools.
+#  - Integrates 'tini' as a minimal init system to safely manage zombie processes
+#    and properly forward OS signals within the container lifecycle.
+################################################################################
+FROM alpine:3.19
+
+RUN apk update && apk add --no-cache \
+    frr \
+    busybox \
+    busybox-extras \
+    tini \
+    tcpdump
+
+################################################################################
+# STEP: Common Utility Library Initialization
+#
+# This layer creates a shared shell library to standardize logging formats.
+# It implements a [TAG] messaging pattern to ensure consistent observability
+# across all subsequent scripts and configurations.
+#
+# Usage:
+#   . /usr/local/bin/common-lib.sh
+#   log_status <command> <args>
+################################################################################
+RUN printf '#!/bin/sh \n\
+log_msg() { \n\
+    local tag=$1 \n\
+\n\
+    if [ $# -lt 2 ]; then \n\
+        echo "[FATAL] Wrong usage of log_msg!" \n\
+        echo "[USAGE] log_msg <TAG> <COMMAND> [ARGUMENTS...]" \n\
+        return 1 \n\
+    fi \n\
+    shift \n\
+    echo "$@" 2>&1 | sed "s/^/[$tag] /" \n\
+} \n\
+\n\
+log_status() { log_msg "STATUS" "$@"; } \n\
+log_init()   { log_msg "INIT" "$@"; } \n\
+log_system() { log_msg "SYSTEM" "$@"; } \n\
+log_action() { log_msg "ACTION" "$@"; } \n\
+log_success(){ log_msg "SUCCESS" "$@"; } \n\
+log_fatal()  { log_msg "FATAL" "$@"; } \n\
+log_error()  { log_msg "ERROR" "$@"; } \n\
+log_warning(){ log_msg "WARNING" "$@"; } \n\
+' > /usr/local/bin/common-lib.sh
+
+RUN chmod +x /usr/local/bin/common-lib.sh
+
+################################################################################
+# STEP: FRR (Free Range Routing) Service Initialization
+#
+# Enables specific routing protocol daemons (Zebra) by 
+# modifying the service configuration. Zebra acts as the central manager 
+# for the underlying kernel routing table.
+#
+# The watchfrr_options are cleared to ensure simplified process monitoring
+# within the containerized environment.
+################################################################################
+RUN sed -i 's/zebra=no/zebra=yes/' /etc/frr/daemons && \
+    sed -i 's/watchfrr_options=.*$/watchfrr_options=""/' /etc/frr/daemons
+
+################################################################################
+# STEP: FRR Service Control Script
+#
+# This script encapsulates the launch logic for all FRR routing daemons.
+# Separating this from the main entrypoint allows for cleaner service 
+# management and independent troubleshooting of the routing stack.
+################################################################################
+RUN printf '#!/bin/sh\n\
+. /usr/local/bin/common-lib.sh\n\
+\n\
+log_system "Launching FRR Routing Stack..." \n\
+/usr/lib/frr/frrinit.sh start \n\
+/usr/lib/frr/frrinit.sh status \n\
+log_success "All FRR daemons are now running in the background." \n\
+' > /usr/local/bin/setup-frr-daemons
+
+RUN chmod +x /usr/local/bin/setup-frr-daemons
+
+################################################################################
+# STEP: Ethernet Bridge Configuration and Multi-Interface Binding
+#
+# This script creates a software bridge (Layer 2) and binds multiple physical/
+# virtual interfaces to it. It ensures reliable execution through precise state 
+# validation for each member interface.
+#
+# Key Features:
+#  - Idempotent Bridge Checks: Uses native 'ip link' to prevent duplicating bridges.
+#  - Port Sanitization: Validates the existence of each target interface before 
+#    attempting to attach it to the bridge, preventing script crashes.
+################################################################################
+RUN printf '#!/bin/sh \n\
+. /usr/local/bin/common-lib.sh \n\
+setup_bridge() { \n\
+    local BR_NAME=$1 \n\
+    shift \n\
+\n\ 
+    log_system "setup_bridge" \n\
+    if ip link show "$BR_NAME" >/dev/null 2>&1; then \n\
+        log_error "$BR_NAME already exists." \n\
+        return 1 \n\
+    fi \n\
+    if ! ip link add "$BR_NAME" type bridge; then \n\
+        log_error "Bridge $BR_NAME not created" && return 2 \n\
+    fi \n\
+    log_status "Created $BR_NAME brige" \n\
+    if ! ip link set dev "$BR_NAME" up; then \n\
+        log_error "$BR_NAME set up fail" && return 2 \n\
+    fi \n\
+    for interface in "$@"; do \n\
+        if ! ip link show "$interface" >/dev/null 2>&1 ; then \n\
+            log_warning "$interface not founded." && continue \n\
+        fi \n\
+        if ! ip link set dev "$interface" master "$BR_NAME"; then \n\
+            log_warning "Failed to set master $interface for $BR_NAME" && continue \n\
+        fi \n\
+    done \n\
+    log_success "Setup bridge $BR_NAME $@" \n\
+    return 0 \n\
+} \n\
+setup_bridge br0 eth0 eth1 eth2 eth3 \n\
+RETURN_CODE=$? \n\
+\n\
+[[ $RETURN_CODE -eq 0 ]] && \n\
+    log_system "Bridge Setting Done" || \n\
+    log_error "docker-ethernet-start error" \n\
+\n\
+return $RETURN_CODE \n\
+' > /usr/local/bin/assign-bridge-start
+
+RUN chmod +x /usr/local/bin/assign-bridge-start
+
+################################################################################
+# STEP: MAC Address Configuration Utility
+#
+# Provides an idempotent way to set hardware (MAC) addresses for network 
+# interfaces. It ensures the interface state is managed correctly during 
+# the transition and verifies the hardware presence before execution.
+################################################################################
+RUN printf '#!/bin/sh \n\
+. /usr/local/bin/common-lib.sh \n\
+setup_mac() { \n\
+    local MAC_ADDR=$1 \n\
+    local INTERFACE=$2 \n\
+\n\
+    log_system "setup_mac" \n\
+    if [ ! -d "/sys/class/net/$INTERFACE" ]; then \n\
+        log_warning "Interface $INTERFACE not found." && return 0 \n\
+    fi \n\
+    if ! ip link set "$INTERFACE" down ; then \n\
+        log_error "Interface $INTERFACE can not setup downlink" && return 0 \n\
+    fi \n\
+    if ! ip link set "$INTERFACE" address "$MAC_ADDR"; then \n\
+        log_warning "Interface $INTERFACE setting MAC address failed" && return 0 \n\
+    fi \n\
+    if ! ip link set "$INTERFACE" up ; then \n\
+        log_error "Interface $INTERFACE can not setup uplink" && return 1 \n\
+    fi \n\
+    return 0 \n\
+} \n\
+\n\
+setup_mac "42:02:02:00:01:00" eth0 && \n\
+setup_mac "42:02:02:00:01:01" eth1 && \n\
+setup_mac "42:02:02:00:01:02" eth2 && \n\
+setup_mac "42:02:02:00:01:03" eth3 \n\
+\n\
+RETURN_CODE=$? \n\
+\n\
+[[ $RETURN_CODE -eq 0 ]] && \n\
+    log_system "VXLAN Setting Done" || \n\
+    log_error "assign-vxlan-start error" \n\
+\n\
+return $RETURN_CODE \n\
+' > /usr/local/bin/assign-mac-start
+
+RUN chmod +x /usr/local/bin/assign-mac-start
+
+################################################################################
+# STEP: Infrastructure Orchestration Entrypoint
+#
+# This script manages the sequential execution of network configurations.
+# 1. Hardware-level identity (MAC) must be established first.
+# 2. Logical Layer 2 topology (Bridge) is constructed thereafter.
+################################################################################
+RUN printf '#!/bin/sh \n\
+. /usr/local/bin/common-lib.sh \n\
+/usr/local/bin/assign-mac-start && \n\
+/usr/local/bin/assign-bridge-start \n\
+\n\
+RETURN_CODE=$? \n\
+\n\
+[[ $RETURN_CODE -eq 0 ]] && \n\
+    log_system "Docker Ethernat Setting Done" || \n\
+    log_error "docker-ethernet-start error" \n\
+\n\
+return $RETURN_CODE \n\
+' > /usr/local/bin/docker-ethernet-start
+
+RUN chmod +x /usr/local/bin/docker-ethernet-start
+
+################################################################################
+# STEP: Container Runtime Entrypoint Orchestrator
+#
+# This script serves as the primary PID 1 process handler (via tini). 
+# It sequences the initialization of the underlying L2/L3 network fabric 
+# before launching the routing management daemon (Zebra).
+#
+# Execution Flow:
+#  1. Infrastructure Setup: Invokes docker-ethernet-start for MAC/Bridge config.
+#  2. Daemon Launch: Starts the FRR Zebra daemon for interface management.
+#  3. Persistence: Enters an interactive shell loop for debugging and stability.
+################################################################################
+RUN printf "#!/bin/sh\n\
+/usr/local/bin/docker-ethernet-start\n\
+/usr/local/bin/setup-frr-daemons \n\
+while true; do /bin/busybox sh ; done \n\
+tail -f /dev/null\n" > /usr/lib/frr/docker-start
+
+RUN chmod +x /usr/lib/frr/docker-start
+
+CMD ["/sbin/tini", "--", "/usr/lib/frr/docker-start"]

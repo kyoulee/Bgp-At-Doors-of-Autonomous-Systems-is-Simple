@@ -1,0 +1,173 @@
+################################################################################
+# STEP: Base Image Selection & Core Network Packages Installation
+#
+# This layer builds the baseline execution environment for the routing container:
+#  - Uses Alpine Linux 3.19 as a verified, secure, and lightweight footprint.
+#  - Installs BusyBox utilities to provide essential CLI debugging tools.
+################################################################################
+FROM alpine:3.19
+
+RUN apk update && apk add --no-cache \
+    busybox \
+    busybox-extras \
+    tini \ 
+    tcpdump
+
+################################################################################
+# STEP: Common Utility Library Initialization
+#
+# This layer creates a shared shell library to standardize logging formats.
+# It implements a [TAG] messaging pattern to ensure consistent observability
+# across all subsequent scripts and configurations.
+#
+# Usage:
+#   . /usr/local/bin/common-lib.sh
+#   log_status <command> <args>
+################################################################################
+RUN printf '#!/bin/sh \n\
+log_msg() { \n\
+    local tag=$1 \n\
+\n\
+    if [ $# -lt 2 ]; then \n\
+        echo "[FATAL] Wrong usage of log_msg!" \n\
+        echo "[USAGE] log_msg <TAG> <COMMAND> [ARGUMENTS...]" \n\
+        return 1 \n\
+    fi \n\
+    shift \n\
+    echo "$@" 2>&1 | sed "s/^/[$tag] /" \n\
+} \n\
+\n\
+log_status() { log_msg "STATUS" "$@"; } \n\
+log_init()   { log_msg "INIT" "$@"; } \n\
+log_system() { log_msg "SYSTEM" "$@"; } \n\
+log_action() { log_msg "ACTION" "$@"; } \n\
+log_success(){ log_msg "SUCCESS" "$@"; } \n\
+log_fatal()  { log_msg "FATAL" "$@"; } \n\
+log_error()  { log_msg "ERROR" "$@"; } \n\
+log_warning(){ log_msg "WARNING" "$@"; } \n\
+' > /usr/local/bin/common-lib.sh
+
+RUN chmod +x /usr/local/bin/common-lib.sh
+
+################################################################################
+# STEP: Network Interface Configuration
+#
+# Automates the setup of IP addresses and routing tables.
+# Uses idempotent functions (setup_interface_ip) to prevent redundant
+# configurations and ensure the system state remains consistent.
+################################################################################
+RUN printf '#!/bin/sh \n\
+. /usr/local/bin/common-lib.sh\n\
+\n\
+setup_interface_ip() { \n\
+    local LOOPBACK_IP=$1 \n\
+    local INTERFACE=$2 \n\
+\n\
+    log_system "setup_interface_ip" \n\
+    if ! ip link show "$INTERFACE" >/dev/null 2>&1; then \n\
+        log_error "Interface $INTERFACE not found" && return 2 \n\
+    fi \n\
+    if ip addr show dev "$INTERFACE" | grep -Fq "$LOOPBACK_IP"; then \n\
+        log_warning "IP $LOOPBACK_IP is already assigned to $INTERFACE." && return 0 \n\ \n\
+    fi \n\
+    if ! ip addr add "$LOOPBACK_IP" dev "$INTERFACE"; then \n\
+        log_error "Failed to add IP $LOOPBACK_IP to $INTERFACE" && return 2 \n\
+    fi \n\
+    ip link set "$INTERFACE" up \n\
+    log_success "Successfully assigned $LOOPBACK_IP to $INTERFACE" \n\
+    return 0 \n\
+} \n\
+setup_interface_ip 30.1.1.2/24 eth1 \n\
+' > /usr/local/bin/assign-ip-start
+
+RUN chmod +x /usr/local/bin/assign-ip-start
+
+################################################################################
+# STEP: MAC Address Configuration Utility
+#
+# Provides an idempotent way to set hardware (MAC) addresses for network 
+# interfaces. It ensures the interface state is managed correctly during 
+# the transition and verifies the hardware presence before execution.
+################################################################################
+RUN printf '#!/bin/sh \n\
+. /usr/local/bin/common-lib.sh \n\
+setup_mac() { \n\
+    local MAC_ADDR=$1 \n\
+    local INTERFACE=$2 \n\
+\n\
+    log_system "setup_mac" \n\
+    if [ ! -d "/sys/class/net/$INTERFACE" ]; then \n\
+        log_warning "Interface $INTERFACE not found." && return 0 \n\
+    fi \n\
+    if ! ip link set "$INTERFACE" down ; then \n\
+        log_error "Interface $INTERFACE can not setup downlink" && return 0 \n\
+    fi \n\
+    if ! ip link set "$INTERFACE" address "$MAC_ADDR"; then \n\
+        log_warning "Interface $INTERFACE setting MAC address failed" && return 0 \n\
+    fi \n\
+    if ! ip link set "$INTERFACE" up ; then \n\
+        log_error "Interface $INTERFACE can not setup uplink" && return 1 \n\
+    fi \n\
+    return 0 \n\
+} \n\
+\n\
+setup_mac "42:02:01:00:02:00" eth0 && \n\
+setup_mac "42:02:01:00:02:01" eth1 \n\
+\n\
+RETURN_CODE=$? \n\
+\n\
+[[ $RETURN_CODE -eq 0 ]] && \n\
+    log_system "VXLAN Setting Done" || \n\
+    log_error "assign-vxlan-start error" \n\
+\n\
+return $RETURN_CODE \n\
+' > /usr/local/bin/assign-mac-start
+
+RUN chmod +x /usr/local/bin/assign-mac-start
+
+################################################################################
+# STEP: Network Orchestration Entrypoint
+#
+# This script acts as a secondary entrypoint to orchestrate multiple network
+# setup scripts (e.g., assign-ip-start). It ensures that all Ethernet-related
+# configurations are executed in the correct sequence before the main process.
+#
+# Usage:
+#   Called internally by /usr/local/bin/docker-start
+################################################################################
+RUN printf '#!/bin/sh\n\
+. /usr/local/bin/common-lib.sh \n\
+/usr/local/bin/assign-mac-start \n\
+/usr/local/bin/assign-ip-start \n\
+\n\
+RETURN_CODE=$? \n\
+\n\
+[[ $RETURN_CODE -eq 0 ]] && \n\
+    log_system "Docker Ethernat Setting Done" || \n\
+    log_error "docker-ethernet-start error" \n\
+\n\
+return $RETURN_CODE \n\
+' > /usr/local/bin/docker-ethernet-start
+
+RUN chmod +x /usr/local/bin/docker-ethernet-start
+
+################################################################################
+# STEP: Main Container Entrypoint
+#
+# This script serves as the final entrypoint for the container. It orchestrates
+# the network initialization sequence and ensures the container remains active.
+# 
+# The design follows the "Keep-Alive" pattern:
+#  1. Executes the network orchestration script.
+#  2. Enters an infinite loop to provide an interactive shell environment.
+#  3. Falls back to 'tail -f' to prevent container exit if the shell terminates.
+################################################################################
+RUN printf '#!/bin/sh \n\
+/usr/local/bin/docker-ethernet-start \n\
+while true; do /bin/busybox sh ; done \n\
+tail -f /dev/null \n\
+' > /usr/local/bin/docker-start
+
+RUN chmod +x /usr/local/bin/docker-start
+
+CMD ["/sbin/tini", "--", "/usr/local/bin/docker-start"]
