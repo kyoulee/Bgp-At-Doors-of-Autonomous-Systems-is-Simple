@@ -122,10 +122,12 @@ setup_interface_ip() { \n\
 } \n\
 setup_interface_ip 20.1.1.1/24 eth1 \n\
 \n\
+RETURN_CODE=$? \n\
+\n\
 [[ $RETURN_CODE -eq 0 ]] && \n\
     log_system "Interface IP Setting Done" || \n\
     log_error "docker-ip-start error" \n\
-\n\
+\n\ 
 return $RETURN_CODE \n\
 ' > /usr/local/bin/assign-ip-start
 
